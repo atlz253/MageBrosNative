@@ -10,6 +10,7 @@
 #include <cstring>
 #include <functional>
 #include "../gfx/device.h"
+#include "../gfx/mesh_buffer.h"
 #include <cctype>
 #include <cstdlib>
 #include <map>
@@ -268,6 +269,13 @@ CD3DFileObject::CD3DFileObject(const std::string& n) : name(n) {
     memset(&materials[0].mtrl, 0, sizeof(D3DMATERIAL7));  // the SDK zeroes the table right after
 }
 
+CD3DFileObject::~CD3DFileObject() = default;
+
+void CD3DFileObject::InvalidateMesh() {
+    if (meshBuffer_) meshBuffer_->Invalidate();
+    for (auto& c : children) c->InvalidateMesh();
+}
+
 namespace {
 // The game's CD3DFileObject constructor sets this up: D3DUtil_InitMaterial(1, 1, 1, 1), then an
 // emissive colour of 0.3 in every channel.
@@ -299,6 +307,7 @@ void CD3DFileObject::Render(Device* dev, bool alpha, bool white) {
         DWORD n = materials[i].numIndices;
         if (!n) continue;
         if (alpha == hasAlpha) {
+            if (!meshBuffer_) meshBuffer_ = std::make_unique<MeshBuffer>();
             dev->SetMaterial(white ? &WhiteMaterial() : &materials[i].mtrl);
             if (materials[i].tex) {
                 // a mod model's texture, modulated by the lit material colour
@@ -314,13 +323,13 @@ void CD3DFileObject::Render(Device* dev, bool alpha, bool white) {
                     dev->SetTextureStageState(0, kStates[k], kValues[k]);
                 }
                 dev->SetTexture(0, materials[i].tex.get());
-                dev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, D3DFVF_VERTEX, vertices.data(), (DWORD)vertices.size(),
-                                          indices.data() + offset, n, 0);
+                dev->DrawMesh(*meshBuffer_, D3DFVF_VERTEX, vertices.data(), (DWORD)vertices.size(), indices.data(),
+                              (DWORD)indices.size(), (DWORD)offset, n);
                 dev->SetTexture(0, texSaved);
                 for (int k = 0; k < 6; k++) dev->SetTextureStageState(0, kStates[k], saved[k]);
             } else {
-                dev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, D3DFVF_VERTEX, vertices.data(), (DWORD)vertices.size(),
-                                          indices.data() + offset, n, 0);
+                dev->DrawMesh(*meshBuffer_, D3DFVF_VERTEX, vertices.data(), (DWORD)vertices.size(), indices.data(),
+                              (DWORD)indices.size(), (DWORD)offset, n);
             }
         }
         offset += n;
@@ -804,12 +813,14 @@ HRESULT CD3DFile::Render(Device* dev) {
 void CD3DFile::Scale(float s) {
     ForEachMesh([&](CD3DFileObject& m) {
         for (auto& v : m.vertices) { v.x *= s; v.y *= s; v.z *= s; }
+        m.InvalidateMesh();
     });
 }
 
 void CD3DFile::Shift(const D3DVECTOR& d) {
     ForEachMesh([&](CD3DFileObject& m) {
         for (auto& v : m.vertices) { v.x += d.x; v.y += d.y; v.z += d.z; }
+        m.InvalidateMesh();
     });
 }
 
@@ -820,6 +831,7 @@ static void RotateMeshes(CD3DFile* f, const D3DMATRIX& mat) {
             D3DMath_VertexMatrixMultiply(out, v, mat);
             v = out;
         }
+        m.InvalidateMesh();
     });
 }
 

@@ -1,11 +1,13 @@
 #include <cstdlib>
 #include "device.h"
+#include "mesh_buffer.h"
 #include "../core/config.h"
 #include "../core/log.h"
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <set>
 
 static Device g_device;
@@ -13,6 +15,33 @@ static Device g_device;
 // the device itself, never touches it)
 static bool g_recordPending = false;
 Device& GetDevice() { return g_device; }
+
+namespace {
+// The work of the frame being drawn: reset by Device::BeginFrame, read by the Statistics Overlay
+// and the once-a-second log line. A file-scope object lets the static helpers count their calls.
+Device::FrameCounters g_frameCounters;
+}  // namespace
+
+const Device::FrameCounters& Device::Counters() const { return g_frameCounters; }
+
+// Counts every OpenGL call made by this translation unit. A function call keeps two counted
+// calls in one expression (the two glGetString calls in Init, say) well-defined.
+namespace GfxFrameWork {
+void CountGLCall() { ++g_frameCounters.glCalls; }
+void CountUploadedBytes(uint64_t bytes) { g_frameCounters.uploadedBytes += bytes; }
+}  // namespace GfxFrameWork
+#define MBN_GL(expr) (GfxFrameWork::CountGLCall(), (expr))
+
+namespace {
+// Texture unit 0 is the only unit the renderer uses; bind and filter only what changed.
+GLuint g_boundTexture = ~0u;
+void BindTexture2D(GLuint id) {
+    // (always sent: the extra passes and the UI bind textures directly, so a cached binding
+    // could be stale; keeping the counter right matters more than one cheap call)
+    MBN_GL(glBindTexture(GL_TEXTURE_2D, id));
+    g_boundTexture = id;
+}
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Shaders: D3D7 fixed-function subset
@@ -373,19 +402,24 @@ void main() { fragColor = vec4(pow(texture(uTex, vUV).rgb, vec3(uGamma)), 1.0); 
 // ---------------------------------------------------------------------------
 // (a recorded draw may still use this texture, or its old image: it is sent first)
 Texture::~Texture() {
+    g_device.Flush2D();
     if (g_recordPending) g_device.FlushRecording();
-    if (id_) glDeleteTextures(1, &id_);
+    if (id_) {
+        MBN_GL(glDeleteTextures(1, &id_));
+        if (g_boundTexture == id_) g_boundTexture = ~0u;
+    }
 }
 
 Texture* Texture::Create(const Image& img, bool colorKey, uint32_t keyRGB, bool mipmaps) {
     Texture* t = new Texture();
     t->mips_ = mipmaps;
-    glGenTextures(1, &t->id_);
+    MBN_GL(glGenTextures(1, &t->id_));
     t->Upload(img, colorKey, keyRGB);  // (new: no recorded draw can use it yet)
     return t;
 }
 
 void Texture::Update(const Image& img, bool colorKey, uint32_t keyRGB) {
+    g_device.Flush2D();
     if (g_recordPending) g_device.FlushRecording();
     Upload(img, colorKey, keyRGB);
 }
@@ -446,23 +480,54 @@ void Texture::Upload(const Image& img, bool colorKey, uint32_t keyRGB) {
             if (!any) break;
         }
     }
-    glBindTexture(GL_TEXTURE_2D, id_);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width_, height_, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-    if (mips_) glGenerateMipmap(GL_TEXTURE_2D);
-    else glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    BindTexture2D(id_);
+    MBN_GL(glPixelStorei(GL_UNPACK_ALIGNMENT, 4));
+    MBN_GL(glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width_, height_, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data()));
+    g_frameCounters.uploadedBytes += (uint64_t)width_ * (uint64_t)height_ * 4;
+    MBN_GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT));
+    MBN_GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT));
+    if (mips_) MBN_GL(glGenerateMipmap(GL_TEXTURE_2D));
+    else MBN_GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0));
+    MBN_GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST));
+    MBN_GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST));
+    minF_ = GL_NEAREST;
+    magF_ = GL_NEAREST;
+    wrapS_ = GL_REPEAT;
+    wrapT_ = GL_REPEAT;
+    aniso_ = 1.f;
+    samplingValid_ = true;
 #ifdef MBN_TEXTURE_DIAG
     {
         static std::set<uint32_t> seen;
         if (seen.insert(((uint32_t)width_ << 16) | (uint32_t)height_).second)
             Log("Texture %dx%d mipmaps=%d", width_, height_, mips_ ? 1 : 0);
     }
-    if (GLenum e = glGetError()) Log("Texture %dx%d: GL error 0x%x", width_, height_, (unsigned)e);
+    if (GLenum e = MBN_GL(glGetError())) Log("Texture %dx%d: GL error 0x%x", width_, height_, (unsigned)e);
 #endif
+}
+
+void Texture::ApplySampling(GLint minF, GLint magF, float aniso, GLint wrapS, GLint wrapT) {
+    if (!samplingValid_ || minF_ != minF) {
+        MBN_GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minF));
+        minF_ = minF;
+    }
+    if (!samplingValid_ || magF_ != magF) {
+        MBN_GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, magF));
+        magF_ = magF;
+    }
+    if (!samplingValid_ || wrapS_ != wrapS) {
+        MBN_GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapS));
+        wrapS_ = wrapS;
+    }
+    if (!samplingValid_ || wrapT_ != wrapT) {
+        MBN_GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrapT));
+        wrapT_ = wrapT;
+    }
+    if (aniso != aniso_) {
+        MBN_GL(glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY, aniso));
+        aniso_ = aniso;
+    }
+    samplingValid_ = true;
 }
 
 Surface::Surface(const Image& img) : image_(img) {}
@@ -505,46 +570,46 @@ static void SetIdentity(D3DMATRIX& m) {
 
 GLuint Device::CompileProgram(const char* vs, const char* fs) {
     auto compile = [](GLenum type, const char* src) -> GLuint {
-        GLuint s = glCreateShader(type);
-        glShaderSource(s, 1, &src, nullptr);
-        glCompileShader(s);
+        GLuint s = MBN_GL(glCreateShader(type));
+        MBN_GL(glShaderSource(s, 1, &src, nullptr));
+        MBN_GL(glCompileShader(s));
         GLint ok = 0;
-        glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+        MBN_GL(glGetShaderiv(s, GL_COMPILE_STATUS, &ok));
         if (!ok) {
             char log[4096];
-            glGetShaderInfoLog(s, sizeof log, nullptr, log);
+            MBN_GL(glGetShaderInfoLog(s, sizeof log, nullptr, log));
             Log("Shader compile error:\n%s", log);
         }
         return s;
     };
-    GLuint p = glCreateProgram();
+    GLuint p = MBN_GL(glCreateProgram());
     GLuint v = compile(GL_VERTEX_SHADER, vs), f = compile(GL_FRAGMENT_SHADER, fs);
-    glAttachShader(p, v);
-    glAttachShader(p, f);
-    glLinkProgram(p);
+    MBN_GL(glAttachShader(p, v));
+    MBN_GL(glAttachShader(p, f));
+    MBN_GL(glLinkProgram(p));
     GLint ok = 0;
-    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    MBN_GL(glGetProgramiv(p, GL_LINK_STATUS, &ok));
     if (!ok) {
         char log[4096];
-        glGetProgramInfoLog(p, sizeof log, nullptr, log);
+        MBN_GL(glGetProgramInfoLog(p, sizeof log, nullptr, log));
         Log("Program link error:\n%s", log);
     }
-    glDeleteShader(v);
-    glDeleteShader(f);
+    MBN_GL(glDeleteShader(v));
+    MBN_GL(glDeleteShader(f));
     return p;
 }
 
 bool Device::Init(SDL_Window* window) {
     window_ = window;
     if (!hgl::Load()) return false;
-    Log("OpenGL %s | %s", (const char*)glGetString(GL_VERSION), (const char*)glGetString(GL_RENDERER));
+    Log("OpenGL %s | %s", (const char*)MBN_GL(glGetString(GL_VERSION)), (const char*)MBN_GL(glGetString(GL_RENDERER)));
     auto glStr = [](GLenum e) {
-        const char* s = (const char*)glGetString(e);
+        const char* s = (const char*)MBN_GL(glGetString(e));
         return std::string(s ? s : "?");
     };
-    glRenderer_ = glStr(GL_RENDERER);
-    glVendor_ = glStr(GL_VENDOR);
-    glVersion_ = glStr(GL_VERSION);
+    glRenderer_ = MBN_GL(glStr(GL_RENDERER));
+    glVendor_ = MBN_GL(glStr(GL_VENDOR));
+    glVersion_ = MBN_GL(glStr(GL_VERSION));
     Log("OpenGL vendor: %s", glVendor_.c_str());
 #if defined(MBN_GLES)
     Log("Renderer backend: gles");
@@ -554,8 +619,8 @@ bool Device::Init(SDL_Window* window) {
 
     prog_ = CompileProgram(kVS, kFS);
     progPresent_ = CompileProgram(kPresentVS, kPresentFS);
-#define U(n) u_.n = glGetUniformLocation(prog_, "u" #n[0] == 0 ? "" : nullptr)
-    auto loc = [&](const char* n) { return glGetUniformLocation(prog_, n); };
+#define U(n) u_.n = MBN_GL(glGetUniformLocation(prog_, "u" #n[0] == 0 ? "" : nullptr))
+    auto loc = [&](const char* n) { return MBN_GL(glGetUniformLocation(prog_, n)); };
     u_.world = loc("uWorld"); u_.view = loc("uView"); u_.proj = loc("uProj");
     u_.lighting = loc("uLighting"); u_.matDiffuse = loc("uMatDiffuse"); u_.matAmbient = loc("uMatAmbient");
     u_.matEmissive = loc("uMatEmissive"); u_.ambient = loc("uAmbient"); u_.lightOn = loc("uLightOn");
@@ -567,8 +632,11 @@ bool Device::Init(SDL_Window* window) {
     u_.screen2D = loc("uScreen2D"); u_.viewport2D = loc("uViewport2D");
     u_.bgra = loc("uBgra");
 #undef U
-    presentTexLoc_ = glGetUniformLocation(progPresent_, "uTex");
-    presentGammaLoc_ = glGetUniformLocation(progPresent_, "uGamma");
+    presentTexLoc_ = MBN_GL(glGetUniformLocation(progPresent_, "uTex"));
+    presentGammaLoc_ = MBN_GL(glGetUniformLocation(progPresent_, "uGamma"));
+    MBN_GL(glUseProgram(progPresent_));
+    MBN_GL(glUniform1i(presentTexLoc_, 0));
+    MBN_GL(glUseProgram(0));
     u_.aoStrength = loc("uAOStrength"); u_.aoTex = loc("uAOTex"); u_.fboSize = loc("uFboSize");
     u_.shadowKind = loc("uShadowKind"); u_.shadowMap = loc("uShadowMap"); u_.lightVP = loc("uLightVP");
     u_.shadowTexel = loc("uShadowTexel"); u_.shadowOffset = loc("uShadowOffset");
@@ -581,8 +649,10 @@ bool Device::Init(SDL_Window* window) {
     glUniform1i(u_.shadowKind, 0);
     glUniform1i(u_.lightKind, 0);
     glUniform1f(u_.sceneDim, 1.f);
+    glUniform1i(u_.tex, 0);
     u_.glowMode = loc("uGlowMode");
     glUniform1i(u_.glowMode, 0);
+    glUseProgram(0);
     progBloomDown_ = CompileProgram(kFullVS, kBloomDownFS);
     progBloomUp_ = CompileProgram(kFullVS, kBloomUpFS);
     progBloomAdd_ = CompileProgram(kFullVS, kBloomAddFS);
@@ -610,14 +680,16 @@ bool Device::Init(SDL_Window* window) {
     constexpr float kBgraSwizzle = 0.0f;
 #endif
     if (u_.bgra >= 0) {
-        glUseProgram(prog_);
-        glUniform1f(u_.bgra, kBgraSwizzle);
-        glUseProgram(0);
+        MBN_GL(glUseProgram(prog_));
+        MBN_GL(glUniform1f(u_.bgra, kBgraSwizzle));
+        MBN_GL(glUseProgram(0));
     }
 
-    glGenVertexArrays(1, &vao_);
-    glGenBuffers(1, &vbo_);
-    glGenBuffers(1, &ibo_);
+    MBN_GL(glActiveTexture(GL_TEXTURE0));
+    MBN_GL(glGenVertexArrays(1, &vao_));
+    MBN_GL(glBindVertexArray(vao_));
+    MBN_GL(glGenBuffers(1, &vbo_));
+    MBN_GL(glGenBuffers(1, &ibo_));
     // the level's 3D, recorded and sent together (G2); MBN_NO_RECORD=1 sends each draw at once,
     // as before 0.4.39, to compare pictures and timings
     gpu3D_.Init();
@@ -627,11 +699,53 @@ bool Device::Init(SDL_Window* window) {
     const char* noRec = SDL_getenv("MBN_NO_RECORD");
     recordEnabled_ = !(noRec && noRec[0] && noRec[0] != '0');
     if (!recordEnabled_) Log("MBN_NO_RECORD: the level's 3D is drawn without recording");
-    if (glProvokingVertex) glProvokingVertex(GL_FIRST_VERTEX_CONVENTION);  // D3D flat shading uses vertex 0
+    // A layout for presenting and one for each vertex format, so the 2D and present paths bind a
+    // ready layout instead of re-setting pointers every frame (R36S performance work).
+    struct PresentVertex { float x, y, z, u, v; };
+    MBN_GL(glGenVertexArrays(1, &vaoVertex_));
+    MBN_GL(glBindVertexArray(vaoVertex_));
+    for (int i = 0; i < 6; i++) MBN_GL(glDisableVertexAttribArray(i));
+    MBN_GL(glBindBuffer(GL_ARRAY_BUFFER, vbo_));
+    MBN_GL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo_));
+    MBN_GL(glEnableVertexAttribArray(0));
+    MBN_GL(glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(D3DVERTEX), (void*)0));
+    MBN_GL(glEnableVertexAttribArray(1));
+    MBN_GL(glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(D3DVERTEX), (void*)12));
+    MBN_GL(glEnableVertexAttribArray(4));
+    MBN_GL(glVertexAttribPointer(4, 2, GL_FLOAT, GL_FALSE, sizeof(D3DVERTEX), (void*)24));
+    MBN_GL(glVertexAttrib4f(2, 1, 1, 1, 1));
+    MBN_GL(glGenVertexArrays(1, &vaoLVertex_));
+    MBN_GL(glBindVertexArray(vaoLVertex_));
+    for (int i = 0; i < 6; i++) MBN_GL(glDisableVertexAttribArray(i));
+    MBN_GL(glBindBuffer(GL_ARRAY_BUFFER, vbo_));
+    MBN_GL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo_));
+    MBN_GL(glEnableVertexAttribArray(0));
+    MBN_GL(glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(D3DLVERTEX), (void*)0));
+    MBN_GL(glEnableVertexAttribArray(2));
+#if defined(MBN_GLES)
+    MBN_GL(glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(D3DLVERTEX), (void*)16));
+#else
+    MBN_GL(glVertexAttribPointer(2, GL_BGRA, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(D3DLVERTEX), (void*)16));
+#endif
+    MBN_GL(glEnableVertexAttribArray(4));
+    MBN_GL(glVertexAttribPointer(4, 2, GL_FLOAT, GL_FALSE, sizeof(D3DLVERTEX), (void*)24));
+    MBN_GL(glVertexAttrib4f(1, 0, 0, 0, 0));
+    MBN_GL(glGenVertexArrays(1, &vaoPresent_));
+    MBN_GL(glBindVertexArray(vaoPresent_));
+    for (int i = 0; i < 6; i++) MBN_GL(glDisableVertexAttribArray(i));
+    MBN_GL(glBindBuffer(GL_ARRAY_BUFFER, vbo_));
+    MBN_GL(glEnableVertexAttribArray(0));
+    MBN_GL(glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(PresentVertex), (void*)0));
+    MBN_GL(glEnableVertexAttribArray(4));
+    MBN_GL(glVertexAttribPointer(4, 2, GL_FLOAT, GL_FALSE, sizeof(PresentVertex), (void*)12));
+    MBN_GL(glBindVertexArray(vao_));
+    if (GLenum e = MBN_GL(glGetError())) Log("Vertex layout setup: GL error 0x%x", (unsigned)e);
+    sent_.vao = vao_;
+    if (glProvokingVertex) MBN_GL(glProvokingVertex(GL_FIRST_VERTEX_CONVENTION));  // D3D flat shading uses vertex 0
     // macOS (and GLES) may not offer it; the game only shades smoothly today, so log it and carry on
     Log("Provoking vertex: %s", glProvokingVertex ? "available" : "absent (smooth shading only)");
     if (hgl::HasExtension("GL_ARB_texture_filter_anisotropic") || hgl::HasExtension("GL_EXT_texture_filter_anisotropic"))
-        glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &maxAniso_);
+        MBN_GL(glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &maxAniso_));
 
     // D3D7 default state
     for (auto& v : rs_) v = 0;
@@ -658,6 +772,7 @@ bool Device::Init(SDL_Window* window) {
     SetIdentity(view_);
     SetIdentity(proj_);
     OnSettingsChanged();
+    SetStateCacheEnabled(true);
     return true;
 }
 
@@ -665,29 +780,34 @@ void Device::Shutdown() {
     rec_.clear();
     recording_ = false;
     DestroyTargets();
-    if (vbo_) glDeleteBuffers(1, &vbo_);
-    if (ibo_) glDeleteBuffers(1, &ibo_);
+    if (vbo_) MBN_GL(glDeleteBuffers(1, &vbo_));
+    if (ibo_) MBN_GL(glDeleteBuffers(1, &ibo_));
     gpu3D_.Free();
     gpuAO_.Free();
     gpuShadow_.Free();
     gpuBloom_.Free();
     DestroyBloomTargets();
     for (GLuint* p : {&progBloomDown_, &progBloomUp_, &progBloomAdd_})
-        if (*p) glDeleteProgram(*p), *p = 0;
+        if (*p) MBN_GL(glDeleteProgram(*p)), *p = 0;
     DestroyAOTargets();
     DestroyShadowTarget();
-    if (progShadow_) glDeleteProgram(progShadow_);
+    if (progShadow_) MBN_GL(glDeleteProgram(progShadow_));
     progShadow_ = 0;
-    if (prepVbo_) glDeleteBuffers(1, &prepVbo_);
-    if (prepIbo_) glDeleteBuffers(1, &prepIbo_);
-    if (emptyVao_) glDeleteVertexArrays(1, &emptyVao_);
+    if (prepVbo_) MBN_GL(glDeleteBuffers(1, &prepVbo_));
+    if (prepIbo_) MBN_GL(glDeleteBuffers(1, &prepIbo_));
+    if (emptyVao_) MBN_GL(glDeleteVertexArrays(1, &emptyVao_));
     for (GLuint* p : {&progDepth_, &progAO_, &progBlur_})
-        if (*p) glDeleteProgram(*p);
+        if (*p) MBN_GL(glDeleteProgram(*p));
     prepVbo_ = prepIbo_ = emptyVao_ = progDepth_ = progAO_ = progBlur_ = 0;
-    if (vao_) glDeleteVertexArrays(1, &vao_);
-    if (prog_) glDeleteProgram(prog_);
-    if (progPresent_) glDeleteProgram(progPresent_);
-    vbo_ = ibo_ = vao_ = prog_ = progPresent_ = 0;
+    if (vao_) MBN_GL(glDeleteVertexArrays(1, &vao_));
+    if (vaoVertex_) MBN_GL(glDeleteVertexArrays(1, &vaoVertex_));
+    if (vaoLVertex_) MBN_GL(glDeleteVertexArrays(1, &vaoLVertex_));
+    if (vaoPresent_) MBN_GL(glDeleteVertexArrays(1, &vaoPresent_));
+    if (prog_) MBN_GL(glDeleteProgram(prog_));
+    if (progPresent_) MBN_GL(glDeleteProgram(progPresent_));
+    vbo_ = ibo_ = vao_ = vaoVertex_ = vaoLVertex_ = vaoPresent_ = prog_ = progPresent_ = 0;
+    g_boundTexture = ~0u;
+    sent_ = SentState{};
 }
 
 void Device::ComputeLayout() {
@@ -730,60 +850,64 @@ void Device::ComputeLayout() {
 }
 
 void Device::DestroyTargets() {
-    if (sceneFbo_) glDeleteFramebuffers(1, &sceneFbo_);
-    if (sceneColorRb_) glDeleteRenderbuffers(1, &sceneColorRb_);
-    if (sceneDepthRb_) glDeleteRenderbuffers(1, &sceneDepthRb_);
-    if (glowRb_) glDeleteRenderbuffers(1, &glowRb_);
+    if (sceneFbo_) MBN_GL(glDeleteFramebuffers(1, &sceneFbo_));
+    if (sceneColorRb_) MBN_GL(glDeleteRenderbuffers(1, &sceneColorRb_));
+    if (sceneDepthRb_) MBN_GL(glDeleteRenderbuffers(1, &sceneDepthRb_));
+    if (glowRb_) MBN_GL(glDeleteRenderbuffers(1, &glowRb_));
     glowRb_ = 0;
-    if (resolveFbo_) glDeleteFramebuffers(1, &resolveFbo_);
-    if (resolveTex_) glDeleteTextures(1, &resolveTex_);
+    if (resolveFbo_) MBN_GL(glDeleteFramebuffers(1, &resolveFbo_));
+    if (resolveTex_) MBN_GL(glDeleteTextures(1, &resolveTex_));
     sceneFbo_ = sceneColorRb_ = sceneDepthRb_ = resolveFbo_ = resolveTex_ = 0;
+    g_boundTexture = ~0u;
+    forceAll_ = true;
 }
 
 void Device::CreateTargets() {
     DestroyTargets();
     GLint maxSamples = 0;
-    glGetIntegerv(GL_MAX_SAMPLES, &maxSamples);
+    MBN_GL(glGetIntegerv(GL_MAX_SAMPLES, &maxSamples));
     samples_ = std::min(GetConfig().msaa, (int)maxSamples);
     if (samples_ < 2) samples_ = 0;
     int W = layout_.fboW, H = layout_.fboH;
-    glGenRenderbuffers(1, &sceneColorRb_);
-    glBindRenderbuffer(GL_RENDERBUFFER, sceneColorRb_);
-    glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples_, GL_RGBA8, W, H);
-    glGenRenderbuffers(1, &sceneDepthRb_);
-    glBindRenderbuffer(GL_RENDERBUFFER, sceneDepthRb_);
-    glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples_, GL_DEPTH24_STENCIL8, W, H);
-    glGenFramebuffers(1, &sceneFbo_);
-    glBindFramebuffer(GL_FRAMEBUFFER, sceneFbo_);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, sceneColorRb_);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, sceneDepthRb_);
+    MBN_GL(glGenRenderbuffers(1, &sceneColorRb_));
+    MBN_GL(glBindRenderbuffer(GL_RENDERBUFFER, sceneColorRb_));
+    MBN_GL(glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples_, GL_RGBA8, W, H));
+    MBN_GL(glGenRenderbuffers(1, &sceneDepthRb_));
+    MBN_GL(glBindRenderbuffer(GL_RENDERBUFFER, sceneDepthRb_));
+    MBN_GL(glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples_, GL_DEPTH24_STENCIL8, W, H));
+    MBN_GL(glGenFramebuffers(1, &sceneFbo_));
+    MBN_GL(glBindFramebuffer(GL_FRAMEBUFFER, sceneFbo_));
+    MBN_GL(glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, sceneColorRb_));
+    MBN_GL(glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, sceneDepthRb_));
     if (GetConfig().bloom > 0) {
         // the glow layer: drawn into only during a level's 3D with Bloom on (glDrawBuffers), so
         // everything else draws as before into the first layer alone
-        glGenRenderbuffers(1, &glowRb_);
-        glBindRenderbuffer(GL_RENDERBUFFER, glowRb_);
-        glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples_, GL_RGBA8, W, H);
-        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_RENDERBUFFER, glowRb_);
+        MBN_GL(glGenRenderbuffers(1, &glowRb_));
+        MBN_GL(glBindRenderbuffer(GL_RENDERBUFFER, glowRb_));
+        MBN_GL(glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples_, GL_RGBA8, W, H));
+        MBN_GL(glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_RENDERBUFFER, glowRb_));
     }
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) Log("Scene framebuffer incomplete");
-    glGenTextures(1, &resolveTex_);
-    glBindTexture(GL_TEXTURE_2D, resolveTex_);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    if (MBN_GL(glCheckFramebufferStatus(GL_FRAMEBUFFER)) != GL_FRAMEBUFFER_COMPLETE) Log("Scene framebuffer incomplete");
+    MBN_GL(glGenTextures(1, &resolveTex_));
+    MBN_GL(glBindTexture(GL_TEXTURE_2D, resolveTex_));
+    MBN_GL(glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr));
     resolveMips_ = layout_.destW > 0 && W > layout_.destW * 2;
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, resolveMips_ ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    if (resolveMips_) glGenerateMipmap(GL_TEXTURE_2D);  // (the levels exist from here on)
-    else glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
-    glGenFramebuffers(1, &resolveFbo_);
-    glBindFramebuffer(GL_FRAMEBUFFER, resolveFbo_);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, resolveTex_, 0);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    MBN_GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, resolveMips_ ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR));
+    MBN_GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR));
+    MBN_GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE));
+    MBN_GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE));
+    if (resolveMips_) MBN_GL(glGenerateMipmap(GL_TEXTURE_2D));  // (the levels exist from here on)
+    else MBN_GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0));
+    MBN_GL(glGenFramebuffers(1, &resolveFbo_));
+    MBN_GL(glBindFramebuffer(GL_FRAMEBUFFER, resolveFbo_));
+    MBN_GL(glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, resolveTex_, 0));
+    MBN_GL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
+    InvalidateState();  // (the raw binds above left the cache stale)
     Log("Render target %dx%d, MSAA %dx", W, H, samples_);
 }
 
 void Device::OnSettingsChanged() {
+    Flush2D();
     FlushRecording();
     if (window_) {
         layout_.fboW = -1;
@@ -792,7 +916,9 @@ void Device::OnSettingsChanged() {
 }
 
 void Device::BeginFrame() {
+    Flush2D();
     FlushRecording();  // (nothing should be left: SetGameplayView(false) sends it)
+    g_frameCounters = FrameCounters{};
     gpu3D_.Poll();
     gpu3D_.FrameDone();
     gpuAO_.Poll();
@@ -806,8 +932,8 @@ void Device::BeginFrame() {
     hudTLRight_ = -1e9f;
     hudTLBottom_ = 0.f;
     ComputeLayout();
-    glBindFramebuffer(GL_FRAMEBUFFER, sceneFbo_);
-    glViewport(0, 0, layout_.fboW, layout_.fboH);
+    BindFbo(GL_FRAMEBUFFER, sceneFbo_);
+    SetViewport(0, 0, layout_.fboW, layout_.fboH);
 }
 
 HRESULT Device::BeginScene() {
@@ -820,50 +946,52 @@ HRESULT Device::EndScene() {
     return D3D_OK;
 }
 
-void Device::WaitForGpu() { glFinish(); }
+void Device::WaitForGpu() { MBN_GL(glFinish()); }
 
 void Device::Present() {
+    Flush2D();
     FlushRecording();
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, sceneFbo_);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, resolveFbo_);
-    glBlitFramebuffer(0, 0, layout_.fboW, layout_.fboH, 0, 0, layout_.fboW, layout_.fboH, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, layout_.windowW, layout_.windowH);
-    glDisable(GL_SCISSOR_TEST);
-    glColorMask(1, 1, 1, 1);
-    glClearColor(0, 0, 0, 1);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glViewport(layout_.destX, layout_.windowH - layout_.destY - layout_.destH, layout_.destW, layout_.destH);
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_BLEND);
-    glDisable(GL_CULL_FACE);
-    glUseProgram(progPresent_);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, resolveTex_);
-    if (resolveMips_) glGenerateMipmap(GL_TEXTURE_2D);
-    glUniform1i(presentTexLoc_, 0);
+    if (!cacheEnabled_) forceAll_ = true;
+    BindFbo(GL_READ_FRAMEBUFFER, sceneFbo_);
+    BindFbo(GL_DRAW_FRAMEBUFFER, resolveFbo_);
+    MBN_GL(glBlitFramebuffer(0, 0, layout_.fboW, layout_.fboH, 0, 0, layout_.fboW, layout_.fboH, GL_COLOR_BUFFER_BIT, GL_NEAREST));
+    BindFbo(GL_FRAMEBUFFER, 0);
+    SetViewport(0, 0, layout_.windowW, layout_.windowH);
+    SetScissor(false);
+    SetColorMask(true);
+    MBN_GL(glClearColor(0, 0, 0, 1));
+    MBN_GL(glClear(GL_COLOR_BUFFER_BIT));
+    SetViewport(layout_.destX, layout_.windowH - layout_.destY - layout_.destH, layout_.destW, layout_.destH);
+    SetCap(GL_DEPTH_TEST, false, sent_.depthTest);
+    SetCap(GL_BLEND, false, sent_.blend);
+    SetCap(GL_CULL_FACE, false, sent_.cull);
+    UseProgram(progPresent_);
+    MBN_GL(glActiveTexture(GL_TEXTURE0));
+    MBN_GL(glBindTexture(GL_TEXTURE_2D, resolveTex_));
+    g_boundTexture = resolveTex_;
+    if (resolveMips_) MBN_GL(glGenerateMipmap(GL_TEXTURE_2D));
+    MBN_GL(glUniform1i(presentTexLoc_, 0));
     // brightness 150% -> exponent 0.67 (lighter mid-tones), 50% -> 2.0 (darker); black and white stay put
-    glUniform1f(presentGammaLoc_, 100.f / (float)std::clamp(GetConfig().brightness, 50, 150));
+    MBN_GL(glUniform1f(presentGammaLoc_, 100.f / (float)std::clamp(GetConfig().brightness, 50, 150)));
     struct V { float x, y, z, u, v; } q[4] = {{-1, -1, 0, 0, 0}, {1, -1, 0, 1, 0}, {-1, 1, 0, 0, 1}, {1, 1, 0, 1, 1}};
-    glBindVertexArray(vao_);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo_);
-    glBufferData(GL_ARRAY_BUFFER, sizeof q, q, GL_STREAM_DRAW);
-    for (int i = 0; i < 6; i++) glDisableVertexAttribArray(i);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(V), (void*)0);
-    glEnableVertexAttribArray(4);
-    glVertexAttribPointer(4, 2, GL_FLOAT, GL_FALSE, sizeof(V), (void*)12);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    BindVao(vaoPresent_);
+    MBN_GL(glBindBuffer(GL_ARRAY_BUFFER, vbo_));
+    MBN_GL(glBufferData(GL_ARRAY_BUFFER, sizeof q, q, GL_STREAM_DRAW));
+    g_frameCounters.uploadedBytes += sizeof q;
+    ++g_frameCounters.draws;
+    MBN_GL(glDrawArrays(GL_TRIANGLE_STRIP, 0, 4));
+    forceAll_ = false;
 }
 
 bool Device::SaveScreenshot(const char* path) {
+    Flush2D();
     FlushRecording();
     int W = layout_.fboW, H = layout_.fboH;
     std::vector<uint8_t> px((size_t)W * H * 4);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, resolveFbo_);
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    MBN_GL(glBindFramebuffer(GL_READ_FRAMEBUFFER, resolveFbo_));
+    MBN_GL(glPixelStorei(GL_PACK_ALIGNMENT, 1));
+    MBN_GL(glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, px.data()));
+    MBN_GL(glBindFramebuffer(GL_READ_FRAMEBUFFER, 0));
     // the Brightness setting, as Present applies it to the screen (left alone at 100%)
     int brightness = std::clamp(GetConfig().brightness, 50, 150);
     if (brightness != 100) {
@@ -895,26 +1023,27 @@ bool Device::SaveScreenshot(const char* path) {
 }
 
 HRESULT Device::Clear(DWORD, const RECT*, DWORD flags, D3DCOLOR color, float z, DWORD) {
+    Flush2D();
     FlushRecording();
-    glBindFramebuffer(GL_FRAMEBUFFER, sceneFbo_);
-    glViewport(0, 0, layout_.fboW, layout_.fboH);
-    glDisable(GL_SCISSOR_TEST);
+    BindFbo(GL_FRAMEBUFFER, sceneFbo_);
+    SetViewport(0, 0, layout_.fboW, layout_.fboH);
+    SetScissor(false);
     GLbitfield mask = 0;
     if (flags & D3DCLEAR_TARGET) {
-        glColorMask(1, 1, 1, 1);
-        glClearColor(((color >> 16) & 0xFF) / 255.f, ((color >> 8) & 0xFF) / 255.f, (color & 0xFF) / 255.f, 1.f);
+        SetColorMask(true);
+        MBN_GL(glClearColor(((color >> 16) & 0xFF) / 255.f, ((color >> 8) & 0xFF) / 255.f, (color & 0xFF) / 255.f, 1.f));
         mask |= GL_COLOR_BUFFER_BIT;
     }
     if (flags & D3DCLEAR_ZBUFFER) {
-        glDepthMask(GL_TRUE);
+        SetDepthMask(true);
 #if defined(MBN_GLES)
-        if (glClearDepthf) glClearDepthf((GLfloat)z);  // ES has no double-precision clear
+        if (glClearDepthf) MBN_GL(glClearDepthf((GLfloat)z));  // ES has no double-precision clear
 #else
-        glClearDepth(z);
+        MBN_GL(glClearDepth(z));
 #endif
         mask |= GL_DEPTH_BUFFER_BIT;
     }
-    glClear(mask);
+    MBN_GL(glClear(mask));
     return D3D_OK;
 }
 
@@ -1021,115 +1150,241 @@ Device::DrawState Device::CurrentState() const {
     return st;
 }
 
+// --- The state cache (R36S performance work) --------------------------------
+// Send only what changed since the last draw. Anything that talks to OpenGL outside these
+// helpers (the extra passes, the present) calls InvalidateState() first, so the next draw
+// sends everything again.
+
+void Device::BindFbo(GLenum target, GLuint id) {
+    if (target == GL_FRAMEBUFFER) {
+        if (!forceAll_ && sent_.fboDraw == id && sent_.fboRead == id) return;
+        MBN_GL(glBindFramebuffer(target, id));
+        sent_.fboDraw = sent_.fboRead = id;
+        return;
+    }
+    GLuint* cache = target == GL_DRAW_FRAMEBUFFER ? &sent_.fboDraw : &sent_.fboRead;
+    if (!forceAll_ && *cache == id) return;
+    MBN_GL(glBindFramebuffer(target, id));
+    *cache = id;
+}
+
+void Device::SetViewport(GLint x, GLint y, GLsizei w, GLsizei h) {
+    if (!forceAll_ && sent_.vpX == x && sent_.vpY == y && sent_.vpW == w && sent_.vpH == h) return;
+    MBN_GL(glViewport(x, y, w, h));
+    sent_.vpX = x;
+    sent_.vpY = y;
+    sent_.vpW = w;
+    sent_.vpH = h;
+}
+
+void Device::UseProgram(GLuint p) {
+    if (!forceAll_ && sent_.program == p) return;
+    MBN_GL(glUseProgram(p));
+    sent_.program = p;
+}
+
+void Device::SetCap(GLenum cap, bool on, int& cache) {
+    if (!forceAll_ && cache == (int)on) return;
+    if (on) MBN_GL(glEnable(cap));
+    else MBN_GL(glDisable(cap));
+    cache = (int)on;
+}
+
+void Device::SetDepthFunc(GLenum f) {
+    if (!forceAll_ && sent_.depthFunc == f) return;
+    MBN_GL(glDepthFunc(f));
+    sent_.depthFunc = f;
+}
+
+void Device::SetDepthMask(bool on) {
+    if (!forceAll_ && sent_.depthMask == (int)on) return;
+    MBN_GL(glDepthMask(on ? GL_TRUE : GL_FALSE));
+    sent_.depthMask = (int)on;
+}
+
+void Device::SetBlend(bool on, GLenum src, GLenum dst) {
+    SetCap(GL_BLEND, on, sent_.blend);
+    if (!on) return;
+    if (forceAll_ || sent_.srcBlend != src || sent_.dstBlend != dst) {
+        MBN_GL(glBlendFunc(src, dst));
+        sent_.srcBlend = src;
+        sent_.dstBlend = dst;
+    }
+}
+
+void Device::SetCull(bool on, GLenum frontFace) {
+    SetCap(GL_CULL_FACE, on, sent_.cull);
+    if (!on) return;
+    if (forceAll_ || sent_.frontFace != (int)frontFace) {
+        MBN_GL(glFrontFace(frontFace));
+        sent_.frontFace = (int)frontFace;
+    }
+}
+
+void Device::SetScissor(bool on) { SetCap(GL_SCISSOR_TEST, on, sent_.scissor); }
+
+void Device::SetColorMask(bool on) {
+    if (!forceAll_ && sent_.colorMask == (int)on) return;
+    MBN_GL(glColorMask(on, on, on, on));
+    sent_.colorMask = (int)on;
+}
+
+void Device::BindVao(GLuint vao) {
+    if (!forceAll_ && sent_.vao == vao) return;
+    MBN_GL(glBindVertexArray(vao));
+    sent_.vao = vao;
+}
+
+void Device::BindVertexLayout(DWORD fvf) { BindVao(fvf == D3DFVF_VERTEX ? vaoVertex_ : vaoLVertex_); }
+
+void Device::Uni1i(GLint loc, GLint& cache, GLint v) {
+    if (!forceAll_ && cache == v) return;
+    MBN_GL(glUniform1i(loc, v));
+    cache = v;
+}
+
+void Device::Uni1f(GLint loc, float& cache, float v) {
+    if (!forceAll_ && cache == v) return;
+    MBN_GL(glUniform1f(loc, v));
+    cache = v;
+}
+
+void Device::Uni3f(GLint loc, float (&cache)[3], const float* v) {
+    if (!forceAll_ && std::memcmp(cache, v, sizeof(float) * 3) == 0) return;
+    MBN_GL(glUniform3f(loc, v[0], v[1], v[2]));
+    std::memcpy(cache, v, sizeof(float) * 3);
+}
+
+void Device::Uni4f(GLint loc, float (&cache)[4], const float* v) {
+    if (!forceAll_ && std::memcmp(cache, v, sizeof(float) * 4) == 0) return;
+    MBN_GL(glUniform4f(loc, v[0], v[1], v[2], v[3]));
+    std::memcpy(cache, v, sizeof(float) * 4);
+}
+
+void Device::UniMat(GLint loc, D3DMATRIX& cache, const D3DMATRIX& m) {
+    if (!forceAll_ && std::memcmp(&cache, &m, sizeof m) == 0) return;
+    MBN_GL(glUniformMatrix4fv(loc, 1, GL_FALSE, m.m()));
+    cache = m;
+}
+
 void Device::ApplyState(DWORD fvf, bool twoD) {
     if (!twoD) {
+        Flush2D();  // (2D asked for before this 3D must stay under it)
         ApplyDrawState(CurrentState(), fvf);
         return;
     }
     FlushRecording();  // (2D is drawn over the 3D already asked for)
-    glBindFramebuffer(GL_FRAMEBUFFER, sceneFbo_);
-    glViewport(0, 0, layout_.fboW, layout_.fboH);
-    glUseProgram(prog_);
-    glUniform1i(u_.screen2D, 1);
-    glUniform4f(u_.constColor, 1, 1, 1, 1);
-    glUniform1i(u_.alphaFix, 0);
-    glUniform1f(u_.aoStrength, 0.f);
-    glUniform1i(u_.shadowKind, 0);
-    glUniform1i(u_.lightKind, 0);
-    glUniform1f(u_.sceneDim, 1.f);
-    glUniform1i(u_.glowMode, 0);
+    if (!cacheEnabled_) forceAll_ = true;
+    BindFbo(GL_FRAMEBUFFER, sceneFbo_);
+    SetViewport(0, 0, layout_.fboW, layout_.fboH);
+    UseProgram(prog_);
+    SetCap(GL_DEPTH_TEST, false, sent_.depthTest);
+    SetBlend(false, GL_ONE, GL_ZERO);
+    SetCull(false, GL_CW);
+    Uni1i(u_.screen2D, sent_.screen2D, 1);
+    float white[4] = {1, 1, 1, 1};
+    Uni4f(u_.constColor, sent_.constColor, white);
+    Uni1i(u_.alphaFix, sent_.alphaFix, 0);
+    // the 2D paths never take the extra passes
+    MBN_GL(glUniform1f(u_.aoStrength, 0.f));
+    MBN_GL(glUniform1i(u_.shadowKind, 0));
+    MBN_GL(glUniform1i(u_.lightKind, 0));
+    MBN_GL(glUniform1f(u_.sceneDim, 1.f));
+    MBN_GL(glUniform1i(u_.glowMode, 0));
+    forceAll_ = false;
 }
 
 // A 3D draw's state sent to OpenGL: the draw being asked for now, or a recorded one (the state
 // as it was when it was asked for).
 void Device::ApplyDrawState(const DrawState& st, DWORD fvf) {
+    if (!cacheEnabled_) forceAll_ = true;
     const Config& cfg = GetConfig();
-    glBindFramebuffer(GL_FRAMEBUFFER, sceneFbo_);
-    glViewport(0, 0, layout_.fboW, layout_.fboH);
-    glUseProgram(prog_);
-    glUniform1i(u_.screen2D, 0);
-    glUniform4f(u_.constColor, 1, 1, 1, 1);
-    glUniform1i(u_.alphaFix, 0);
-    glUniform1f(u_.aoStrength, 0.f);  // (the replay sets it for the draws that take AO)
-    glUniform1i(u_.shadowKind, 0);    // (and the shadows' way, likewise)
-    glUniform1i(u_.lightKind, 0);     // (and the lights')
-    glUniform1f(u_.sceneDim, 1.f);    // (and the dimming)
-    glUniform1i(u_.glowMode, 0);      // (and what goes in the bloom's glow layer)
+    BindFbo(GL_FRAMEBUFFER, sceneFbo_);
+    SetViewport(0, 0, layout_.fboW, layout_.fboH);
+    UseProgram(prog_);
+    Uni1i(u_.screen2D, sent_.screen2D, 0);
+    float white[4] = {1, 1, 1, 1};
+    Uni4f(u_.constColor, sent_.constColor, white);
+    Uni1i(u_.alphaFix, sent_.alphaFix, 0);
+    // (the replay sets these for the draws that take the extra passes; they are not cached)
+    MBN_GL(glUniform1f(u_.aoStrength, 0.f));
+    MBN_GL(glUniform1i(u_.shadowKind, 0));
+    MBN_GL(glUniform1i(u_.lightKind, 0));
+    MBN_GL(glUniform1f(u_.sceneDim, 1.f));
+    MBN_GL(glUniform1i(u_.glowMode, 0));
 
     // depth
-    if (st.zEnable) {
-        glEnable(GL_DEPTH_TEST);
-        glDepthFunc(GL_LEQUAL);
-    } else {
-        glDisable(GL_DEPTH_TEST);
-    }
-    glDepthMask(st.zWrite ? GL_TRUE : GL_FALSE);
+    SetCap(GL_DEPTH_TEST, st.zEnable != 0, sent_.depthTest);
+    if (st.zEnable) SetDepthFunc(GL_LEQUAL);
+    SetDepthMask(st.zWrite != 0);
     // blending
-    if (st.blendEnable) {
-        glEnable(GL_BLEND);
-        glBlendFunc(MapBlend(st.srcBlend), MapBlend(st.destBlend));
-    } else {
-        glDisable(GL_BLEND);
-    }
+    SetBlend(st.blendEnable != 0, MapBlend(st.srcBlend), MapBlend(st.destBlend));
     // culling: D3DCULL_CCW removes triangles that appear counter-clockwise on screen, i.e. the
     // front faces are the visually clockwise ones (GL_CW in GL's convention).
     DWORD cull = st.cullMode;
     if (cull == D3DCULL_NONE) {
-        glDisable(GL_CULL_FACE);
+        SetCull(false, GL_CW);
     } else {
-        glEnable(GL_CULL_FACE);
-        glFrontFace(cull == D3DCULL_CCW ? GL_CW : GL_CCW);
-        glCullFace(GL_BACK);
+        SetCull(true, cull == D3DCULL_CCW ? GL_CW : GL_CCW);
+        // (the game never changes the face; GL_BACK is the default and stays)
     }
 
     // transforms (with optional widescreen projection)
     D3DMATRIX world = st.world;
     D3DMATRIX proj = DrawProj(st);
-    glUniformMatrix4fv(u_.world, 1, GL_FALSE, world.m());
-    glUniformMatrix4fv(u_.view, 1, GL_FALSE, st.view.m());
-    glUniformMatrix4fv(u_.proj, 1, GL_FALSE, proj.m());
+    UniMat(u_.world, sent_.world, world);
+    UniMat(u_.view, sent_.view, st.view);
+    UniMat(u_.proj, sent_.proj, proj);
 
     // lighting
     bool lighting = st.lighting != 0 && (fvf & 0x010);  // needs normals
-    glUniform1i(u_.lighting, lighting);
-    glUniform1i(u_.hasVertexColor, (fvf & 0x040) != 0);
-    glUniform4fv(u_.matDiffuse, 1, &st.material.diffuse.r);
-    glUniform4fv(u_.matAmbient, 1, &st.material.ambient.r);
-    glUniform4fv(u_.matEmissive, 1, &st.material.emissive.r);
+    Uni1i(u_.lighting, sent_.lighting, lighting);
+    Uni1i(u_.hasVertexColor, sent_.hasVertexColor, (fvf & 0x040) != 0);
+    if (forceAll_ || !sent_.matValid || std::memcmp(&sent_.material, &st.material, sizeof st.material) != 0) {
+        MBN_GL(glUniform4fv(u_.matDiffuse, 1, &st.material.diffuse.r));
+        MBN_GL(glUniform4fv(u_.matAmbient, 1, &st.material.ambient.r));
+        MBN_GL(glUniform4fv(u_.matEmissive, 1, &st.material.emissive.r));
+        sent_.material = st.material;
+        sent_.matValid = true;
+    }
     DWORD a = st.ambient;
-    glUniform4f(u_.ambient, ((a >> 16) & 0xFF) / 255.f, ((a >> 8) & 0xFF) / 255.f, (a & 0xFF) / 255.f, ((a >> 24) & 0xFF) / 255.f);
+    float ambient[4] = {((a >> 16) & 0xFF) / 255.f, ((a >> 8) & 0xFF) / 255.f, (a & 0xFF) / 255.f,
+                        ((a >> 24) & 0xFF) / 255.f};
+    Uni4f(u_.ambient, sent_.ambient, ambient);
     bool lightOn = st.lightEnabled && st.light.type == D3DLIGHT_DIRECTIONAL;
-    glUniform1i(u_.lightOn, lightOn);
+    Uni1i(u_.lightOn, sent_.lightOn, lightOn);
     if (lightOn) {
         D3DVECTOR d = st.light.direction;
         float len = Magnitude(d);
         if (len > 0) d = d / len;
-        glUniform3f(u_.lightDir, -d.x, -d.y, -d.z);
-        glUniform4fv(u_.lightDiffuse, 1, &st.light.diffuse.r);
+        float dir[3] = {-d.x, -d.y, -d.z};
+        Uni3f(u_.lightDir, sent_.lightDir, dir);
+        Uni4f(u_.lightDiffuse, sent_.lightDiffuse, &st.light.diffuse.r);
     }
-    glUniform1i(u_.flat, st.shadeMode == D3DSHADE_FLAT);
+    Uni1i(u_.flat, sent_.flat, st.shadeMode == D3DSHADE_FLAT);
 
     // texture stage 0
     Texture* texture = st.texture;
     bool texOn = texture != nullptr && (fvf & 0xF00) != 0;
-    glUniform1i(u_.texOn, texOn);
-    glUniform1i(u_.colorOp, st.colorOp);
-    glUniform1i(u_.colorArg1, st.colorArg1);
-    glUniform1i(u_.colorArg2, st.colorArg2);
-    glUniform1i(u_.alphaOp, st.alphaOp);
-    glUniform1i(u_.alphaArg1, st.alphaArg1);
-    glUniform1i(u_.alphaArg2, st.alphaArg2);
-    glUniform1i(u_.alphaTest, 0);
+    Uni1i(u_.texOn, sent_.texOn, texOn);
+    Uni1i(u_.colorOp, sent_.colorOp, st.colorOp);
+    Uni1i(u_.colorArg1, sent_.colorArg1, st.colorArg1);
+    Uni1i(u_.colorArg2, sent_.colorArg2, st.colorArg2);
+    Uni1i(u_.alphaOp, sent_.alphaOp, st.alphaOp);
+    Uni1i(u_.alphaArg1, sent_.alphaArg1, st.alphaArg1);
+    Uni1i(u_.alphaArg2, sent_.alphaArg2, st.alphaArg2);
+    Uni1i(u_.alphaTest, sent_.alphaTest, 0);
     if (texOn && texture->SoftAlpha() && st.blendEnable) {
         DWORD src = st.srcBlend, dst = st.destBlend;
-        if (src == D3DBLEND_ONE) glUniform1i(u_.alphaFix, 1);
+        if (src == D3DBLEND_ONE) Uni1i(u_.alphaFix, sent_.alphaFix, 1);
         else if ((src == D3DBLEND_ZERO && dst == D3DBLEND_SRCCOLOR) || (src == D3DBLEND_DESTCOLOR && dst == D3DBLEND_ZERO))
-            glUniform1i(u_.alphaFix, 2);
+            Uni1i(u_.alphaFix, sent_.alphaFix, 2);
     }
     if (texOn) {
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, texture->Id());
-        glUniform1i(u_.tex, 0);
+        MBN_GL(glActiveTexture(GL_TEXTURE0));
+        MBN_GL(glBindTexture(GL_TEXTURE_2D, texture->Id()));
+        g_boundTexture = texture->Id();
+        Uni1i(u_.tex, sent_.tex, 0);
         bool linMag = st.magFilter >= D3DTFG_LINEAR || cfg.smoothTextures;
         bool linMin = st.minFilter >= D3DTFG_LINEAR || cfg.smoothTextures;
         GLint minF = linMin ? GL_LINEAR : GL_NEAREST;
@@ -1141,12 +1396,10 @@ void Device::ApplyDrawState(const DrawState& st, DWORD fvf) {
         // point-sampled mipmaps and no anisotropy, so the level made no difference.)
         bool aniso = texture->HasMips() && cfg.anisotropy > 1;
         if (texture->HasMips() && (aniso || (linMin && cfg.smoothTextures))) minF = GL_LINEAR_MIPMAP_LINEAR;
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minF);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linMag ? GL_LINEAR : GL_NEAREST);
-        if (maxAniso_ > 1.f)
-            glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY,
-                            aniso ? std::min((float)cfg.anisotropy, maxAniso_) : 1.f);
+        float anisoValue = maxAniso_ > 1.f && aniso ? std::min((float)cfg.anisotropy, maxAniso_) : 1.f;
+        texture->ApplySampling(minF, linMag ? GL_LINEAR : GL_NEAREST, anisoValue, GL_REPEAT, GL_REPEAT);
     }
+    forceAll_ = false;
 }
 
 static GLenum MapPrim(D3DPRIMITIVETYPE t, DWORD n, GLsizei* count) {
@@ -1196,15 +1449,16 @@ HRESULT Device::DrawIndexedPrimitive(D3DPRIMITIVETYPE type, DWORD fvf, const voi
     }
     ApplyState(fvf, false);
     size_t stride = fvf == D3DFVF_VERTEX ? sizeof(D3DVERTEX) : sizeof(D3DLVERTEX);
-    glBindVertexArray(vao_);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo_);
-    glBufferData(GL_ARRAY_BUFFER, stride * numVerts, verts, GL_STREAM_DRAW);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo_);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(WORD) * numIndices, indices, GL_STREAM_DRAW);
-    SetupAttribs(fvf);
+    BindVertexLayout(fvf);
+    MBN_GL(glBindBuffer(GL_ARRAY_BUFFER, vbo_));
+    MBN_GL(glBufferData(GL_ARRAY_BUFFER, stride * numVerts, verts, GL_STREAM_DRAW));
+    MBN_GL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo_));
+    MBN_GL(glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(WORD) * numIndices, indices, GL_STREAM_DRAW));
+    g_frameCounters.uploadedBytes += stride * numVerts + sizeof(WORD) * numIndices;
     GLsizei count;
     GLenum mode = MapPrim(type, numIndices, &count);
-    glDrawElements(mode, count, GL_UNSIGNED_SHORT, (void*)0);
+    ++g_frameCounters.draws;
+    MBN_GL(glDrawElements(mode, count, GL_UNSIGNED_SHORT, (void*)0));
     return D3D_OK;
 }
 
@@ -1216,14 +1470,32 @@ HRESULT Device::DrawPrimitive(D3DPRIMITIVETYPE type, DWORD fvf, const void* vert
     }
     ApplyState(fvf, false);
     size_t stride = fvf == D3DFVF_VERTEX ? sizeof(D3DVERTEX) : sizeof(D3DLVERTEX);
-    glBindVertexArray(vao_);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo_);
-    glBufferData(GL_ARRAY_BUFFER, stride * numVerts, verts, GL_STREAM_DRAW);
-    SetupAttribs(fvf);
+    BindVertexLayout(fvf);
+    MBN_GL(glBindBuffer(GL_ARRAY_BUFFER, vbo_));
+    MBN_GL(glBufferData(GL_ARRAY_BUFFER, stride * numVerts, verts, GL_STREAM_DRAW));
+    g_frameCounters.uploadedBytes += stride * numVerts;
     GLsizei count;
     GLenum mode = MapPrim(type, numVerts, &count);
-    glDrawArrays(mode, 0, count);
+    ++g_frameCounters.draws;
+    MBN_GL(glDrawArrays(mode, 0, count));
     return D3D_OK;
+}
+
+void Device::DrawMesh(MeshBuffer& mesh, DWORD fvf, const void* verts, DWORD numVerts, const WORD* indices,
+                      DWORD numIndices, DWORD firstIndex, DWORD indexCount) {
+    if (!verts || !indices || !numIndices || !indexCount) return;
+    mesh.Ensure(fvf, verts, numVerts, indices, numIndices);
+    if (recording_) {
+        RecordMesh(mesh, fvf, numVerts, firstIndex, indexCount);
+        forceAll_ = true;  // (Ensure bound a layout of its own)
+        return;
+    }
+    Flush2D();
+    ApplyDrawState(CurrentState(), fvf);
+    BindVao(mesh.Vao());
+    mesh.DrawIndexed(firstIndex, indexCount);
+    ++g_frameCounters.draws;
+    forceAll_ = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1260,6 +1532,24 @@ void Device::Record(D3DPRIMITIVETYPE type, DWORD fvf, const void* verts, DWORD n
     g_recordPending = true;
 }
 
+void Device::RecordMesh(MeshBuffer& mesh, DWORD fvf, DWORD numVerts, DWORD firstIndex, DWORD indexCount) {
+    RecordedDraw d;
+    d.st = CurrentState();
+    d.fvf = fvf;
+    d.indexed = true;
+    d.mode = GL_TRIANGLES;
+    d.count = (GLsizei)indexCount;
+    d.firstVertex = 0;
+    d.numVerts = numVerts;
+    d.firstIndex = 0;
+    d.numIndices = indexCount;
+    d.mesh = &mesh;
+    d.meshFirstIndex = firstIndex;
+    d.meshIndexCount = indexCount;
+    rec_.push_back(d);
+    g_recordPending = true;
+}
+
 void Device::FlushRecording() {
     if (rec_.empty()) return;
     // the extra passes first (G3: ambient occlusion), each on the graphics card's stopwatch
@@ -1291,7 +1581,6 @@ void Device::FlushRecording() {
         glUniform3fv(u_.lightColor, lightCount_, lightColor_);
         glUniform1fv(u_.lightReach, lightCount_, lightReach_);
         glUniform3f(u_.eye, shadowEye_.x, shadowEye_.y, shadowEye_.z);
-        glUniform4f(u_.matDiffuse, 1, 1, 1, 1);
     }
     const int bloomLevel = glowRb_ ? std::clamp(GetConfig().bloom, 0, 2) : 0;
     bloomActive_ = false;
@@ -1308,6 +1597,9 @@ void Device::FlushRecording() {
         glDrawBuffers(2, kBoth);
         glClearBufferfv(GL_COLOR, 1, kBlack);
     }
+    // The extra passes and the setup above changed OpenGL state behind the cache's back: the
+    // replay's first draw sends everything again.
+    InvalidateState();
     gpu3D_.Begin();
     // Each draw exactly as it would have been sent when it was asked for: its state, then its own
     // vertices and indices uploaded on their own. (Drawing them all from one shared upload, with a
@@ -1352,9 +1644,17 @@ void Device::FlushRecording() {
                 glUniform2f(u_.fboSize, (float)layout_.fboW, (float)layout_.fboH);
             }
         }
+        g_frameCounters.draws++;
+        if (d.mesh) {
+            BindVao(d.mesh->Vao());
+            d.mesh->DrawIndexed(d.meshFirstIndex, d.meshIndexCount);
+            continue;
+        }
+        BindVao(vao_);
         glBindBuffer(GL_ARRAY_BUFFER, vbo_);
         glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(d.numVerts * 32), recVerts_.data() + d.firstVertex * 32,
                      GL_STREAM_DRAW);
+        g_frameCounters.uploadedBytes += (uint64_t)d.numVerts * 32;
         if (d.indexed) {
             glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo_);
             glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(d.numIndices * sizeof(WORD)),
@@ -1382,6 +1682,7 @@ void Device::FlushRecording() {
     recVerts_.clear();
     recIdx_.clear();
     g_recordPending = false;
+    InvalidateState();  // (the bloom and the passes left the state cache stale)
 }
 
 void Device::GpuTimer::Init() {
@@ -1711,6 +2012,7 @@ int Device::CollectLights() {
     const float strength = std::clamp(GetConfig().lightStrength, 50, 150) / 100.f;
     for (const RecordedDraw& d : rec_) {
         const DrawState& st = d.st;
+        if (d.mesh) continue;  // (kept on the card; its vertices are not in recVerts_)
         if (!st.gameplayView || !st.blendEnable || !st.texture || d.fvf != D3DFVF_LVERTEX) continue;
         if (st.destBlend != D3DBLEND_DESTALPHA && st.destBlend != D3DBLEND_ONE) continue;  // additive only
         const LightSource* src = nullptr;
@@ -1892,6 +2194,13 @@ bool Device::ComputeShadows(int quality) {
     for (const RecordedDraw& d : rec_) {
         if (!DrawKind(d)) continue;
         glUniformMatrix4fv(shadowLoc_[0], 1, GL_FALSE, d.st.world.m());
+        if (d.mesh) {
+            glBindVertexArray(d.mesh->Vao());
+            glDrawElements(GL_TRIANGLES, (GLsizei)d.meshIndexCount, GL_UNSIGNED_SHORT,
+                           (void*)(d.meshFirstIndex * sizeof(WORD)));
+            continue;
+        }
+        glBindVertexArray(vao_);
         if (d.indexed)
             glDrawElementsBaseVertex(d.mode, d.count, GL_UNSIGNED_SHORT, (void*)(d.firstIndex * sizeof(WORD)),
                                      (GLint)d.firstVertex);
@@ -1951,6 +2260,13 @@ bool Device::ComputeAO() {
         glUniformMatrix4fv(depthLoc_[0], 1, GL_FALSE, d.st.world.m());
         glUniformMatrix4fv(depthLoc_[1], 1, GL_FALSE, d.st.view.m());
         glUniformMatrix4fv(depthLoc_[2], 1, GL_FALSE, proj.m());
+        if (d.mesh) {
+            glBindVertexArray(d.mesh->Vao());
+            glDrawElements(GL_TRIANGLES, (GLsizei)d.meshIndexCount, GL_UNSIGNED_SHORT,
+                           (void*)(d.meshFirstIndex * sizeof(WORD)));
+            continue;
+        }
+        glBindVertexArray(vao_);
         if (d.indexed)
             glDrawElementsBaseVertex(d.mode, d.count, GL_UNSIGNED_SHORT, (void*)(d.firstIndex * sizeof(WORD)),
                                      (GLint)d.firstVertex);
@@ -1993,30 +2309,13 @@ bool Device::ComputeAO() {
 
 void Device::Draw2DQuad(float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, Texture* t,
                         bool alphaTest, const float* color, bool linear) {
-    ApplyState(0, true);
-    glDisable(GL_DEPTH_TEST);
-    glDepthMask(GL_FALSE);
-    glDisable(GL_BLEND);
-    glDisable(GL_CULL_FACE);
-    float sx = 2.f / layout_.virtualW, sy = -2.f / 480.f;
-    glUniform4f(u_.viewport2D, sx, sy, layout_.offsetX * sx - 1.f, 1.f);
-    glUniform1i(u_.lighting, 0);
-    glUniform1i(u_.flat, 0);
-    glUniform1i(u_.alphaTest, alphaTest);
-    glUniform1i(u_.alphaFix, 0);
-    glUniform1i(u_.texOn, t != nullptr);
-    glUniform1i(u_.colorOp, D3DTOP_SELECTARG1);
-    glUniform1i(u_.colorArg1, D3DTA_TEXTURE);
-    glUniform1i(u_.alphaOp, D3DTOP_SELECTARG1);
-    glUniform1i(u_.alphaArg1, D3DTA_TEXTURE);
-    if (t) {
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, t->Id());
-        glUniform1i(u_.tex, 0);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    if (!quadBatch_.empty() &&
+        (quadBatchTex_ != t || quadBatchAlphaTest_ != alphaTest || quadBatchLinear_ != linear))
+        Flush2D();
+    if (quadBatch_.empty()) {
+        quadBatchTex_ = t;
+        quadBatchAlphaTest_ = alphaTest;
+        quadBatchLinear_ = linear;
     }
     uint32_t c = 0xFFFFFFFF;
     if (color) {
@@ -2030,11 +2329,47 @@ void Device::Draw2DQuad(float x0, float y0, float x1, float y1, float u0, float 
     q[2].x = x0; q[2].y = y1; q[2].tu = u0; q[2].tv = v1;
     q[3].x = x1; q[3].y = y1; q[3].tu = u1; q[3].tv = v1;
     for (auto& v : q) v.color = c;
-    glBindVertexArray(vao_);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo_);
-    glBufferData(GL_ARRAY_BUFFER, sizeof q, q, GL_STREAM_DRAW);
-    SetupAttribs(D3DFVF_LVERTEX);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    quadBatch_.push_back(q[0]);
+    quadBatch_.push_back(q[1]);
+    quadBatch_.push_back(q[3]);
+    quadBatch_.push_back(q[0]);
+    quadBatch_.push_back(q[3]);
+    quadBatch_.push_back(q[2]);
+}
+
+void Device::Flush2D() {
+    if (quadBatch_.empty()) return;
+    ApplyState(0, true);
+    SetCap(GL_DEPTH_TEST, false, sent_.depthTest);
+    SetDepthMask(false);
+    SetBlend(false, GL_ONE, GL_ZERO);
+    SetCull(false, GL_CW);
+    float sx = 2.f / layout_.virtualW, sy = -2.f / 480.f;
+    float viewport[4] = {sx, sy, layout_.offsetX * sx - 1.f, 1.f};
+    Uni4f(u_.viewport2D, sent_.viewport2D, viewport);
+    Uni1i(u_.lighting, sent_.lighting, 0);
+    Uni1i(u_.flat, sent_.flat, 0);
+    Uni1i(u_.alphaTest, sent_.alphaTest, quadBatchAlphaTest_);
+    Uni1i(u_.texOn, sent_.texOn, quadBatchTex_ != nullptr);
+    Uni1i(u_.colorOp, sent_.colorOp, D3DTOP_SELECTARG1);
+    Uni1i(u_.colorArg1, sent_.colorArg1, D3DTA_TEXTURE);
+    Uni1i(u_.alphaOp, sent_.alphaOp, D3DTOP_SELECTARG1);
+    Uni1i(u_.alphaArg1, sent_.alphaArg1, D3DTA_TEXTURE);
+    if (quadBatchTex_) {
+        BindTexture2D(quadBatchTex_->Id());
+        GLint f = quadBatchLinear_ ? GL_LINEAR : GL_NEAREST;
+        quadBatchTex_->ApplySampling(f, f, 1.f, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE);
+    }
+    BindVertexLayout(D3DFVF_LVERTEX);
+    MBN_GL(glBindBuffer(GL_ARRAY_BUFFER, vbo_));
+    MBN_GL(glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(quadBatch_.size() * sizeof(D3DLVERTEX)), quadBatch_.data(),
+                        GL_STREAM_DRAW));
+    g_frameCounters.uploadedBytes += quadBatch_.size() * sizeof(D3DLVERTEX);
+    ++g_frameCounters.draws;
+    MBN_GL(glDrawArrays(GL_TRIANGLES, 0, (GLsizei)quadBatch_.size()));
+    quadBatch_.clear();
+    quadBatchTex_ = nullptr;
+    forceAll_ = false;
 }
 
 HRESULT Device::BltToBackBuffer(const RECT* dst, Surface* src, const RECT* srcRect, bool useColorKey) {
@@ -2065,6 +2400,7 @@ HRESULT Device::ColorFill(const RECT* dst, uint32_t rgb) {
     RECT d = dst ? *dst : RECT{0, 0, 640, 480};
     float c[4] = {((rgb >> 16) & 0xFF) / 255.f, ((rgb >> 8) & 0xFF) / 255.f, (rgb & 0xFF) / 255.f, 1.f};
     // Untextured quad with constant colour
+    Flush2D();
     ApplyState(0, true);
     Draw2DQuad((float)d.left, (float)d.top, (float)d.right, (float)d.bottom, 0, 0, 0, 0, nullptr, false, c, false);
     return D3D_OK;
@@ -2100,74 +2436,68 @@ int Device::HudEdgeShift() const {
 // same state as DrawUIQuad: the Statistics Overlay's letters, which one by one cost a draw each.
 void Device::DrawUIQuads(const std::vector<D3DLVERTEX>& verts, Texture* t) {
     if (verts.empty()) return;
+    Flush2D();
     ApplyState(0, true);
-    glDisable(GL_DEPTH_TEST);
-    glDepthMask(GL_FALSE);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glDisable(GL_CULL_FACE);
+    SetCap(GL_DEPTH_TEST, false, sent_.depthTest);
+    SetDepthMask(false);
+    SetBlend(true, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    SetCull(false, GL_CW);
     float sx = 2.f / layout_.virtualW, sy = -2.f / 480.f;
-    glUniform4f(u_.viewport2D, sx, sy, layout_.offsetX * sx - 1.f, 1.f);
-    glUniform1i(u_.lighting, 0);
-    glUniform1i(u_.flat, 0);
-    glUniform1i(u_.alphaTest, 0);
-    glUniform1i(u_.alphaFix, 0);
-    glUniform1i(u_.texOn, t != nullptr);
-    glUniform1i(u_.colorOp, D3DTOP_MODULATE);
-    glUniform1i(u_.colorArg1, D3DTA_TEXTURE);
-    glUniform1i(u_.colorArg2, D3DTA_DIFFUSE);
-    glUniform1i(u_.alphaOp, D3DTOP_MODULATE);
-    glUniform1i(u_.alphaArg1, D3DTA_TEXTURE);
-    glUniform1i(u_.alphaArg2, D3DTA_DIFFUSE);
-    glUniform4f(u_.constColor, 1, 1, 1, 1);
+    float viewport[4] = {sx, sy, layout_.offsetX * sx - 1.f, 1.f};
+    Uni4f(u_.viewport2D, sent_.viewport2D, viewport);
+    Uni1i(u_.lighting, sent_.lighting, 0);
+    Uni1i(u_.flat, sent_.flat, 0);
+    Uni1i(u_.alphaTest, sent_.alphaTest, 0);
+    Uni1i(u_.texOn, sent_.texOn, t != nullptr);
+    Uni1i(u_.colorOp, sent_.colorOp, D3DTOP_MODULATE);
+    Uni1i(u_.colorArg1, sent_.colorArg1, D3DTA_TEXTURE);
+    Uni1i(u_.colorArg2, sent_.colorArg2, D3DTA_DIFFUSE);
+    Uni1i(u_.alphaOp, sent_.alphaOp, D3DTOP_MODULATE);
+    Uni1i(u_.alphaArg1, sent_.alphaArg1, D3DTA_TEXTURE);
+    Uni1i(u_.alphaArg2, sent_.alphaArg2, D3DTA_DIFFUSE);
+    float white[4] = {1, 1, 1, 1};
+    Uni4f(u_.constColor, sent_.constColor, white);
     if (t) {
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, t->Id());
-        glUniform1i(u_.tex, 0);
+        BindTexture2D(t->Id());
         GLint f = t->UILinear() ? GL_LINEAR : GL_NEAREST;
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        t->ApplySampling(f, f, 1.f, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE);
     }
-    glBindVertexArray(vao_);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo_);
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(verts.size() * sizeof(D3DLVERTEX)), verts.data(), GL_STREAM_DRAW);
-    SetupAttribs(D3DFVF_LVERTEX);
-    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)verts.size());
+    BindVertexLayout(D3DFVF_LVERTEX);
+    MBN_GL(glBindBuffer(GL_ARRAY_BUFFER, vbo_));
+    MBN_GL(glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(verts.size() * sizeof(D3DLVERTEX)), verts.data(), GL_STREAM_DRAW));
+    g_frameCounters.uploadedBytes += verts.size() * sizeof(D3DLVERTEX);
+    ++g_frameCounters.draws;
+    MBN_GL(glDrawArrays(GL_TRIANGLES, 0, (GLsizei)verts.size()));
+    forceAll_ = false;
 }
 
 void Device::DrawUIQuad(float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, Texture* t,
                         const float rgba[4]) {
+    Flush2D();
     ApplyState(0, true);
-    glDisable(GL_DEPTH_TEST);
-    glDepthMask(GL_FALSE);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glDisable(GL_CULL_FACE);
+    SetCap(GL_DEPTH_TEST, false, sent_.depthTest);
+    SetDepthMask(false);
+    SetBlend(true, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    SetCull(false, GL_CW);
     float sx = 2.f / layout_.virtualW, sy = -2.f / 480.f;
-    glUniform4f(u_.viewport2D, sx, sy, layout_.offsetX * sx - 1.f, 1.f);
-    glUniform1i(u_.lighting, 0);
-    glUniform1i(u_.flat, 0);
-    glUniform1i(u_.alphaTest, 0);
-    glUniform1i(u_.alphaFix, 0);
-    glUniform1i(u_.texOn, t != nullptr);
-    glUniform1i(u_.colorOp, D3DTOP_MODULATE);
-    glUniform1i(u_.colorArg1, D3DTA_TEXTURE);
-    glUniform1i(u_.colorArg2, D3DTA_DIFFUSE);
-    glUniform1i(u_.alphaOp, D3DTOP_MODULATE);
-    glUniform1i(u_.alphaArg1, D3DTA_TEXTURE);
-    glUniform1i(u_.alphaArg2, D3DTA_DIFFUSE);
-    glUniform4f(u_.constColor, 1, 1, 1, 1);
+    float viewport[4] = {sx, sy, layout_.offsetX * sx - 1.f, 1.f};
+    Uni4f(u_.viewport2D, sent_.viewport2D, viewport);
+    Uni1i(u_.lighting, sent_.lighting, 0);
+    Uni1i(u_.flat, sent_.flat, 0);
+    Uni1i(u_.alphaTest, sent_.alphaTest, 0);
+    Uni1i(u_.texOn, sent_.texOn, t != nullptr);
+    Uni1i(u_.colorOp, sent_.colorOp, D3DTOP_MODULATE);
+    Uni1i(u_.colorArg1, sent_.colorArg1, D3DTA_TEXTURE);
+    Uni1i(u_.colorArg2, sent_.colorArg2, D3DTA_DIFFUSE);
+    Uni1i(u_.alphaOp, sent_.alphaOp, D3DTOP_MODULATE);
+    Uni1i(u_.alphaArg1, sent_.alphaArg1, D3DTA_TEXTURE);
+    Uni1i(u_.alphaArg2, sent_.alphaArg2, D3DTA_DIFFUSE);
+    float white[4] = {1, 1, 1, 1};
+    Uni4f(u_.constColor, sent_.constColor, white);
     if (t) {
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, t->Id());
-        glUniform1i(u_.tex, 0);
+        BindTexture2D(t->Id());
         GLint f = t->UILinear() ? GL_LINEAR : GL_NEAREST;
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        t->ApplySampling(f, f, 1.f, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE);
     }
     auto b =[](float f) { return (uint32_t)(std::min(1.f, std::max(0.f, f)) * 255.f + 0.5f); };
     uint32_t c = b(rgba[3]) << 24 | b(rgba[0]) << 16 | b(rgba[1]) << 8 | b(rgba[2]);
@@ -2178,10 +2508,12 @@ void Device::DrawUIQuad(float x0, float y0, float x1, float y1, float u0, float 
     q[2].x = x0; q[2].y = y1; q[2].tu = u0; q[2].tv = v1;
     q[3].x = x1; q[3].y = y1; q[3].tu = u1; q[3].tv = v1;
     for (auto& v : q) v.color = c;
-    glBindVertexArray(vao_);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo_);
-    glBufferData(GL_ARRAY_BUFFER, sizeof q, q, GL_STREAM_DRAW);
-    SetupAttribs(D3DFVF_LVERTEX);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    glDisable(GL_BLEND);
+    BindVertexLayout(D3DFVF_LVERTEX);
+    MBN_GL(glBindBuffer(GL_ARRAY_BUFFER, vbo_));
+    MBN_GL(glBufferData(GL_ARRAY_BUFFER, sizeof q, q, GL_STREAM_DRAW));
+    g_frameCounters.uploadedBytes += sizeof q;
+    ++g_frameCounters.draws;
+    MBN_GL(glDrawArrays(GL_TRIANGLE_STRIP, 0, 4));
+    SetBlend(false, GL_ONE, GL_ZERO);
+    forceAll_ = false;
 }

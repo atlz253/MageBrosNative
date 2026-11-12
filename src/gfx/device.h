@@ -6,10 +6,18 @@
 #include "../core/d3dtypes.h"
 #include "../core/assets.h"
 #include "gl.h"
+#include <cstdint>
 #include <string>
 #include <vector>
 
 struct SDL_Window;
+class MeshBuffer;
+
+// The frame-work counters are shared with MeshBuffer, which uploads geometry outside Device.
+namespace GfxFrameWork {
+void CountGLCall();
+void CountUploadedBytes(uint64_t bytes);
+}  // namespace GfxFrameWork
 
 class Texture {
 public:
@@ -30,6 +38,10 @@ public:
     void SetResId(uint16_t id) { resId_ = id; }
     uint16_t ResId() const { return resId_; }
     const float* AvgColor() const { return avg_; }
+    // Sets only the sampling parameters this texture does not already have. Update() records what
+    // it wrote, so the first draw after a texture upload sends the differences.
+    void ApplySampling(GLint minF, GLint magF, float aniso, GLint wrapS, GLint wrapT);
+    void ForgetSampling() { samplingValid_ = false; }
 
 private:
     uint16_t resId_ = 0;
@@ -40,6 +52,9 @@ private:
     GLuint id_ = 0;
     bool mips_ = false;
     bool softAlpha_ = false;
+    bool samplingValid_ = false;
+    GLint minF_ = 0, magF_ = 0, wrapS_ = 0, wrapT_ = 0;
+    float aniso_ = 0.f;
 };
 
 // Emulates a DirectDraw off-screen surface holding a sprite sheet.
@@ -74,6 +89,16 @@ struct FrameLayout {
 
 class Device {
 public:
+    friend class Texture;  // (a texture being changed sends the 2D quads that use it first)
+    // The work one drawn frame asked of OpenGL, reset by BeginFrame. The counters are read by the
+    // Statistics Overlay and the once-a-second log line (R36S performance work).
+    struct FrameCounters {
+        uint64_t draws = 0;
+        uint64_t glCalls = 0;
+        uint64_t uploadedBytes = 0;
+    };
+    const FrameCounters& Counters() const;
+
     bool Init(SDL_Window* window);
     void Shutdown();
 
@@ -157,10 +182,22 @@ public:
     HRESULT DrawIndexedPrimitive(D3DPRIMITIVETYPE type, DWORD fvf, const void* verts, DWORD numVerts,
                                  const WORD* indices, DWORD numIndices, DWORD flags);
     HRESULT DrawPrimitive(D3DPRIMITIVETYPE type, DWORD fvf, const void* verts, DWORD numVerts, DWORD flags);
+    // A mesh whose vertices and indices do not change: MeshBuffer keeps them on the card, and
+    // this draws a range of its indices. The game's rendering code keeps its draw order.
+    void DrawMesh(MeshBuffer& mesh, DWORD fvf, const void* verts, DWORD numVerts, const WORD* indices,
+                  DWORD numIndices, DWORD firstIndex, DWORD indexCount);
 
     // --- DirectDraw back-buffer operations, in the original 640x480 pixel space ---
     HRESULT BltToBackBuffer(const RECT* dst, Surface* src, const RECT* srcRect, bool useColorKey);
     HRESULT ColorFill(const RECT* dst, uint32_t rgb);
+
+    // State caching (the R36S performance work): send only what changed since the last draw.
+    // InvalidateState() makes the next draw send everything, for paths that talk to OpenGL
+    // outside ApplyState. The cache is enabled by the change; the switch keeps the old path
+    // available for comparison.
+    void SetStateCacheEnabled(bool on) { cacheEnabled_ = on; if (!on) forceAll_ = true; }
+    bool StateCacheEnabled() const { return cacheEnabled_; }
+    void InvalidateState() { forceAll_ = true; }
 
     // Overlay UI (options menu): quad in 480-high virtual space, alpha blended, texture x colour.
     void DrawUIQuad(float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, Texture* t,
@@ -191,11 +228,16 @@ private:
         size_t firstVertex, numVerts;   // in recVerts_ (32 bytes a vertex, both formats)
         size_t firstIndex, numIndices;  // in recIdx_ (indexed draws only)
         bool indexed;
+        // Geometry kept on the card (MeshBuffer): the draw reads it from there, in this replay and
+        // in the extra passes, instead of from the frame's CPU copy (R36S performance work).
+        MeshBuffer* mesh = nullptr;
+        DWORD meshFirstIndex = 0, meshIndexCount = 0;
     };
     DrawState CurrentState() const;
     void ApplyDrawState(const DrawState& st, DWORD fvf);
     void Record(D3DPRIMITIVETYPE type, DWORD fvf, const void* verts, DWORD numVerts, const WORD* indices,
                 DWORD numIndices);
+    void RecordMesh(MeshBuffer& mesh, DWORD fvf, DWORD numVerts, DWORD firstIndex, DWORD indexCount);
     // A graphics-card stopwatch: queries used in turn, read frames later without waiting (a query
     // still pending when its turn comes round leaves that run untimed)
     struct GpuTimer {
@@ -285,7 +327,56 @@ private:
     void ApplyState(DWORD fvf, bool twoD);
     void Draw2DQuad(float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, Texture* t,
                     bool alphaTest, const float* color, bool linear);
+    void Flush2D();
     GLuint CompileProgram(const char* vs, const char* fs);
+
+    // The state sent to OpenGL, kept so an unchanged value is not sent again. `forceAll_` is set
+    // by InvalidateState() and by a path that changes state without using these helpers.
+    struct SentState {
+        GLuint fboDraw = ~0u, fboRead = ~0u, program = ~0u, vao = ~0u;
+        GLint vpX = -1000000, vpY = -1000000, vpW = -1, vpH = -1;
+        GLint screen2D = -1, lighting = -1, hasVertexColor = -1, flat = -1, lightOn = -1;
+        GLint texOn = -1, tex = -1, colorOp = -1, colorArg1 = -1, colorArg2 = -1, alphaOp = -1, alphaArg1 = -1,
+              alphaArg2 = -1, alphaTest = -1, alphaFix = -1;
+        float constColor[4] = {-2, -2, -2, -2};
+        float viewport2D[4] = {-2, -2, -2, -2};
+        bool matValid = false;
+        D3DMATERIAL7 material{};
+        bool ambientValid = false;
+        float ambient[4] = {-2, -2, -2, -2};
+        bool lightValid = false;
+        float lightDir[3] = {-2, -2, -2};
+        float lightDiffuse[4] = {-2, -2, -2, -2};
+        bool matricesValid = false;
+        D3DMATRIX world{}, view{}, proj{};
+        int depthTest = -1, depthMask = -1, blend = -1, cull = -1, frontFace = -1;
+        GLenum depthFunc = 0, srcBlend = 0, dstBlend = 0;
+        int scissor = -1, colorMask = -1;
+    } sent_;
+    bool cacheEnabled_ = false;
+    bool forceAll_ = true;
+    // Consecutive 2D quads with the same texture and state, drawn in one call at the next state
+    // change or before Present.
+    std::vector<D3DLVERTEX> quadBatch_;
+    Texture* quadBatchTex_ = nullptr;
+    bool quadBatchAlphaTest_ = false, quadBatchLinear_ = false;
+    void BindFbo(GLenum target, GLuint id);
+    void SetViewport(GLint x, GLint y, GLsizei w, GLsizei h);
+    void UseProgram(GLuint p);
+    void SetCap(GLenum cap, bool on, int& cache);
+    void SetDepthFunc(GLenum f);
+    void SetDepthMask(bool on);
+    void SetBlend(bool on, GLenum src, GLenum dst);
+    void SetCull(bool on, GLenum frontFace);
+    void SetScissor(bool on);
+    void SetColorMask(bool on);
+    void BindVao(GLuint vao);
+    void BindVertexLayout(DWORD fvf);
+    void Uni1i(GLint loc, GLint& cache, GLint v);
+    void Uni1f(GLint loc, float& cache, float v);
+    void Uni3f(GLint loc, float (&cache)[3], const float* v);
+    void Uni4f(GLint loc, float (&cache)[4], const float* v);
+    void UniMat(GLint loc, D3DMATRIX& cache, const D3DMATRIX& m);
 
     SDL_Window* window_ = nullptr;
     FrameLayout layout_;
@@ -299,7 +390,8 @@ private:
     bool inScene_ = false;
 
     GLuint prog_ = 0, progPresent_ = 0;
-    GLuint vao_ = 0, vbo_ = 0, ibo_ = 0;
+    GLuint vbo_ = 0, ibo_ = 0;
+    GLuint vao_ = 0, vaoVertex_ = 0, vaoLVertex_ = 0, vaoPresent_ = 0;
     struct Uniforms {
         GLint world, view, proj, lighting, matDiffuse, matAmbient, matEmissive, ambient, lightOn, lightDir,
             lightDiffuse, flat, texOn, colorOp, colorArg1, colorArg2, alphaOp, alphaArg1, alphaArg2, alphaTest,

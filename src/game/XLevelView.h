@@ -19,6 +19,7 @@
 
 class Device;
 class CD3DFile;
+class MeshBuffer;
 
 class XLevelView {
 public:
@@ -71,7 +72,7 @@ public:
 private:
     void PlaceObjects();
     void BuildMarkers(const std::function<bool(const Object&)>& keep = nullptr);
-    void DrawMesh(Device* d, const MapGeometry::Mesh& m, uint16_t texture);
+    void DrawMesh(Device* d, MapGeometry::Mesh& m, std::unique_ptr<MeshBuffer>& buffer, uint16_t texture);
 
     int world_ = -1, level_ = -1;
     LevelGrid grid_;
@@ -81,4 +82,5 @@ private:
     std::vector<Object> objects_;
     MapGeometry::Mesh goalPads_;  // the goal's 88x88 pad (texture 420)
     MapGeometry::Mesh markers_;   // coloured boxes, untextured
+    std::unique_ptr<MeshBuffer> floorBuffer_, undergroundBuffer_, goalBuffer_, markerBuffer_;
 };

@@ -251,6 +251,10 @@ it, or to run the tests that need the game, you still need your own `MageBros.ex
   device needs (`SDL_EGL_LIBRARY=libMali.so`, because the console's EGL/GLES live in libMali and
   SDL does not find them by itself), runs the game through OpenGL ES 3.0 on KMSDRM at 640x480,
   and writes a log to `/roms2/ports/magebros/magebros.log`. Nothing on the system is replaced.
+  A fresh console install selects the **Performance** graphics profile (Options > Graphics >
+  Graphics profile: no antialiasing or anisotropy, 100% render scale). The renderer's frame work
+  is much smaller now; the console currently presents at a stable 30 FPS because of its KMSDRM
+  swap path, with Smooth motion on and VSync on.
 - **Linux desktop:** the tools and tests build with `-DMBN_BUILD_GAME=OFF`, and a GLES-only
   Linux device can be built with `-DMBN_GLES=ON`; a desktop with OpenGL 3.3 uses the default
   backend. The Windows game cross-compiles with MinGW-w64

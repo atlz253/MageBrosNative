@@ -26,6 +26,7 @@ struct Config {
     int maxFps = 0;                // 0 = uncapped (or vsync limited); -1..-4 = the refresh rate over 1..4
     bool interpolation = false;    // smooth motion: drawing between the 100 Hz logic ticks
     bool lowLatency = false;       // with VSync: no finished frames queued in the driver (waits after each swap)
+    int graphicsProfile = 0;       // 0 = manual, 1 = performance (R36S), 2 = quality
     int msaa = 4;                  // 0, 2, 4, 8
     int anisotropy = 8;            // 1 = off
     bool smoothTextures = false;   // force linear filtering on 3D textures that used point sampling
@@ -94,6 +95,8 @@ struct Config {
     bool firstRun = false;              // no ini existed at start (not saved): size the window to the monitor
     bool Load(const std::string& file);
     bool Save() const;
+    // Applies the preset's antialiasing, anisotropy and render scale. Manual leaves them alone.
+    void ApplyGraphicsProfile();
 };
 
 Config& GetConfig();

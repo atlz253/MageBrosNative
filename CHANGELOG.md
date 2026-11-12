@@ -9,6 +9,21 @@ Where we are and what comes next: [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## [Unreleased]
 
+- **Much less drawing work per frame, especially on the R36S.** Render state is sent only when it
+  changes, static models and level geometry stay on the graphics card, and consecutive HUD/2D
+  quads are batched. In level 1-1 the R36S frame went from about 137 draws and 7,300 OpenGL calls
+  to about 102 draws and 600 calls, with the renderer's CPU time roughly halved. The dense parts
+  of 1-1 and 1-2 now hold a stable 30 FPS instead of dipping to 20. The console currently
+  presents every second 60 Hz refresh through its KMSDRM swap path; Smooth motion, VSync,
+  borderless mode and the frame limit all leave that 30 FPS pace unchanged.
+- **Graphics profile** (Options > Graphics): Manual (default), Performance (the R36S: no
+  antialiasing or anisotropy) or Quality (the desktop defaults). A fresh console install starts
+  on Performance; changing one of the three settings switches back to Manual.
+- Measured frame work in the log and the Full Statistics Overlay: draw calls, OpenGL calls,
+  uploaded bytes, logic/render time and GPU wait.
+- **R36S:** off-screen torches, needle fans and hammers are no longer drawn; the `mbn_r36s_probe`
+  gained `--swap-test` and `--present-test` for checking the console's display path.
+
 ## [0.4.47] - 2026-11-13
 
 - **Music plays on macOS without a SoundFont.** The game now uses the Mac's built-in General MIDI

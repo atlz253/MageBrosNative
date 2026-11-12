@@ -826,6 +826,19 @@ OptionsMenu::Page OptionsMenu::GraphicsPage() {
     Page p;
     p.title = "OPTIONS > GRAPHICS";
     auto& v = p.items;
+    v.push_back({"Graphics profile", "Manual, performance (the R36S: no antialiasing or anisotropy) or quality (the desktop defaults).",
+                 [] {
+                     int k = GetConfig().graphicsProfile;
+                     return k == 1 ? std::string("Performance") : k == 2 ? std::string("Quality") : std::string("Manual");
+                 },
+                 [this](int d) {
+                     static const std::vector<int> l{0, 1, 2};
+                     GetConfig().graphicsProfile = l[(size_t)CycleIndex(l, GetConfig().graphicsProfile, d)];
+                     GetConfig().ApplyGraphicsProfile();
+                     GetDevice().OnSettingsChanged();
+                     Save();
+                 },
+                 nullptr, nullptr});
     v.push_back({"Antialiasing", "Smooths polygon edges (MSAA). Lowered automatically if unsupported.",
                  [] {
                      int m = GetConfig().msaa;
@@ -834,6 +847,7 @@ OptionsMenu::Page OptionsMenu::GraphicsPage() {
                  [this](int d) {
                      static const std::vector<int> l{0, 2, 4, 8, 16};
                      GetConfig().msaa = l[(size_t)CycleIndex(l, GetConfig().msaa, d)];
+                     GetConfig().graphicsProfile = 0;
                      GetDevice().OnSettingsChanged();
                      Save();
                  },
@@ -844,6 +858,7 @@ OptionsMenu::Page OptionsMenu::GraphicsPage() {
                  [this](int d) {
                      static const std::vector<float> l{0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f};
                      GetConfig().renderScale = StepFloat(l, GetConfig().renderScale, d);
+                     GetConfig().graphicsProfile = 0;
                      GetDevice().OnSettingsChanged();
                      Save();
                  },
@@ -856,6 +871,7 @@ OptionsMenu::Page OptionsMenu::GraphicsPage() {
                  [this](int d) {
                      static const std::vector<int> l{1, 2, 4, 8, 16};
                      GetConfig().anisotropy = l[(size_t)CycleIndex(l, GetConfig().anisotropy, d)];
+                     GetConfig().graphicsProfile = 0;
                      Save();
                  },
                  nullptr, nullptr});

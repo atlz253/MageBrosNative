@@ -484,15 +484,24 @@ int main(int argc, char** argv) {
     SetFatalHook(ShowFatal);
     Log("Mage Bros. Native %s", MBN_VERSION_STRING);
     Config& cfg = GetConfig();
-    if (!cfg.Load(dataPath + "magebros_native.ini")) {
+    bool loaded = cfg.Load(dataPath + "magebros_native.ini");
+    if (!loaded) {
         cfg.path = dataPath + "magebros_native.ini";
         cfg.firstRun = true;  // the window is then sized to the monitor (CD3DApplication::Create)
-        cfg.Save();
-    } else if (cfg.version < Config::kCurrentVersion || cfg.gameVersion != MBN_VERSION_STRING) {
+    }
+#if defined(MBN_GLES)
+    // a fresh console install starts on the performance preset; an existing ini keeps its choice
+    if (cfg.firstRun && cfg.graphicsProfile == 0) cfg.graphicsProfile = 1;
+#endif
+    cfg.ApplyGraphicsProfile();
+    if (!loaded || cfg.version < Config::kCurrentVersion || cfg.gameVersion != MBN_VERSION_STRING) {
         // rewrite older files with the current comments, keeping their values, and files from
         // another build with this build's game_version
         cfg.Save();
     }
+    Log("Graphics profile: %s (MSAA %d, anisotropy %d, render scale %d%%)",
+        cfg.graphicsProfile == 1 ? "performance" : cfg.graphicsProfile == 2 ? "quality" : "manual", cfg.msaa,
+        cfg.anisotropy, (int)std::lround(cfg.renderScale * 100));
     std::string gamePath = cfg.gamePath;
     bool allowUnverified = false, twoPlayer = false, ending = false;
     for (size_t i = 0; i < args.size(); i++) {
@@ -543,6 +552,7 @@ int main(int argc, char** argv) {
         // The model and bitmap caches own GL buffers and textures. Their static destructors
         // would run after SDL_Quit, i.e. without a context, which crashes the Mali driver.
         JModelList::Clear();
+        CD3DFile::ClearCache();  // the parsed roots own MeshBuffers too
         JSurfaceList::Clear();
     }
     Log("Shutdown: application");

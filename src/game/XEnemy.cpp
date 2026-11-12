@@ -844,8 +844,7 @@ public:
         CollisionCheck_Hero(game_->heroB);
     }
     void Render(Device* d) override {
-        // (drawn wherever it is: no visibility test)
-        if (liveState_ == XEnemyBase::NON) return;
+        if (liveState_ == XEnemyBase::NON || !game_->IsVisible(pos_)) return;
         model_->Render(d);
         fanBase_->Render(d);
         shadow_->SetPosXZ(startPos_);
@@ -1400,8 +1399,7 @@ public:
         CollisionCheck_Hero(game_->heroB);
     }
     void Render(Device* d) override {
-        // (drawn wherever it is: no visibility test)
-        if (liveState_ == XEnemyBase::NON) return;
+        if (liveState_ == XEnemyBase::NON || !game_->IsVisible(pos_)) return;
         model_->Render(d);
         hammerBase_->Render(d);
     }

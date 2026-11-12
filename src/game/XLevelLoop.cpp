@@ -526,7 +526,8 @@ void XLevelLoop::RenderObjects(Device* d, const D3DMATRIX& view) {
         c.shadow->SetPosXZ(c.pos + c.model->BlendOffset());  // (native: where the model is drawn)
         c.shadow->Render(d);
     }
-    for (Torch& t : torches_) t.model->Render(d);
+    for (Torch& t : torches_)
+        if (game_->IsVisible(t.pos)) t.model->Render(d);
     // platforms, static objects, candles, bullets, enemies, the boss
     platforms_->Render(d);
     statics_->Render(d);

@@ -1,11 +1,12 @@
 # The renderer's work per draw (an optimization for weak graphics hardware)
 
-**Status: not built, not planned. A write-up for later.** Issue 6 of the review of 2026-11-09
-([SMOOTH_MOTION.md](SMOOTH_MOTION.md), "Review of 2026-11-09"). The owner (2026-11-10) may come
-back to it if players on low-end hardware report low frame rates; until then nothing here is to
-be built. Written from reading the code at 0.4.32. **Nothing in this file has been measured or
-tried**: the first chunk below is to measure, and the plan after it should be judged again from
-those numbers.
+**Status: in progress (change `r36s-performance`, 2026-11-12).** Issue 6 of the review of
+2026-11-09 ([SMOOTH_MOTION.md](SMOOTH_MOTION.md), "Review of 2026-11-09"). The owner (2026-11-10)
+asked to come back to it when players on low-end hardware reported low frame rates; the R36S
+report (30 fps, stutter as enemies and the 1-2 fences appear) started this change. R0 is
+measured; R1-R4 are pending. The baseline is in
+[MageBrosNative/research/acceptance/r36s-performance.md](../../research/acceptance/r36s-performance.md).
+Written from reading the code at 0.4.32; the R0 numbers below are the first measured data.
 
 **Since then (2026-11-11, on the `graphics-enhancements` branch, merged into `main` as 0.4.46):** the graphics enhancements'
 G2 built a recorder in `Device` (`docs/GRAPHICS_ENHANCEMENTS.md`, "G2 as built"): a level's 3D
@@ -31,6 +32,54 @@ second and 3-10 at about 1110 (1280 x 960, VSync off, Smooth motion on).
 - **It changes no game logic.** `src/game` asks for the same things in the same order; only how
   `src/gfx/device.cpp` and `src/framework/d3dfile.cpp` (the port's own code) carry them out
   changes. Every picture must stay byte for byte the same.
+
+## R0 measured (R36S, 2026-11-12)
+
+The instrumented build counts draws, OpenGL calls, uploaded bytes and the frame's logic, render,
+CPU and swap times; the numbers are in
+[research/acceptance/r36s-performance.md](../../research/acceptance/r36s-performance.md).
+The short version, at 640x480, VSync on, MSAA 0, anisotropy 1, Smooth motion off:
+
+| Spot | Draws | GL calls | Render | Logic | CPU | FPS |
+|---|---:|---:|---:|---:|---:|---:|
+| 1-1 start | 137 | 7324 | 13.1 ms | 0.6 ms | 17.0 ms | 19.7 |
+| 1-1 enemies | 155 | 8302 | 15.1 ms | 0.8 ms | 19.1 ms | 20.0 |
+| 1-2 fences | 150 | 8063 | 15.7 ms | 1.1 ms | 20.0 ms | 20.0 |
+| 1-10 boss | 185 | 10021 | 15.2 ms | 0.7 ms | 19.5 ms | 19.5 |
+
+The GPU wait (Low latency) is 0.01 ms, and a blank `--swap-test` and the same FBO/blit/present
+path in `--present-test` both run at 60 FPS on the console. The limit is therefore the CPU's
+draw submission (about 55 OpenGL calls per draw), not the graphics card, the panel, the audio
+synthesizer or VSync. Render scale 0.75 alone only moves the frame from 20 to 30 FPS because the
+draw submission is unchanged. This confirms that R1/R2 and R3 are the work that matters.
+
+## R1/R2 built (2026-11-12)
+
+`Device` now records what it last sent and skips unchanged framebuffer, viewport, program,
+depth/blend/cull, transforms, material, light, texture-stage state, uniforms and texture
+filtering. Three long-lived vertex layouts replace the per-draw attribute reset. On the R36S,
+1-1 went from 7,324 to 926 OpenGL calls a frame and the renderer's 13.1 ms to 9.2 ms; the 1-2
+fences went from 8,063 to 1,065 calls and 15.7 to 11.6 ms. The picture is byte-identical in the
+level viewer across the Graphics options. Upload bytes did not change, which is why R3 is next.
+
+## R3/R4 built (2026-11-12/13)
+
+Models and the level meshes now keep their geometry in `MeshBuffer`s; the recurring uploads fell
+from 340 KB to about 12 KB a frame and the 1-1 render time from 9.2 to 4.8 ms. Consecutive HUD
+quads are batched, removing about 25 more draws. The R36S frame is now 114 draws and 664 OpenGL
+calls, down from 137 draws and 7,324 calls. The CPU is about 8 ms; the remaining 30 FPS is the
+swap/pageflip wait (every second refresh), not draw submission. See the acceptance file for the
+full numbers and the presentation-path follow-up.
+
+## R5/R6 built (2026-11-13)
+
+The R36S has an explicit performance profile (MSAA 0, anisotropy 1, render scale 100%) selected
+on a fresh install and available in Options > Graphics. Torches, needle fans and hammers now skip
+their draw when outside the visible range. At the fixed 1-1 spot the frame is 102 draws, 600
+OpenGL calls, 12 KB uploaded and 6.4 ms of CPU; it is a stable 30 FPS. The remaining time is the
+KMSDRM pageflip wait (about 26 ms), which presents every second 60 Hz refresh. The probe can
+present the same kind of frame at 60 FPS, so this is a presentation-path follow-up, not a
+renderer-cost one. The full measurements are in the acceptance file.
 
 ## What happens now
 

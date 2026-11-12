@@ -75,6 +75,7 @@ bool Config::Load(const std::string& file) {
             else if (k == "max_fps") maxFps = std::max(-4, iv);
             else if (k == "interpolation") interpolation = toBool(v);
             else if (k == "low_latency") lowLatency = toBool(v);
+            else if (k == "profile") graphicsProfile = std::clamp(iv, 0, 2);
             else if (k == "msaa") msaa = std::clamp(iv, 0, 16);
             else if (k == "anisotropy") anisotropy = std::clamp(iv, 1, 16);
             else if (k == "smooth_textures") smoothTextures = toBool(v);
@@ -181,6 +182,18 @@ bool Config::Load(const std::string& file) {
     // config_version 14: [mods] lists add-ons with the winner first (it was last before)
     if (version > 0 && version < 14) std::reverse(mods.begin(), mods.end());
     return true;
+}
+
+void Config::ApplyGraphicsProfile() {
+    if (graphicsProfile == 1) {  // performance: the R36S
+        msaa = 0;
+        anisotropy = 1;
+        renderScale = 1.0f;
+    } else if (graphicsProfile == 2) {  // quality: the desktop defaults
+        msaa = 4;
+        anisotropy = 8;
+        renderScale = 1.0f;
+    }
 }
 
 bool Config::Save() const {
@@ -304,6 +317,11 @@ bool Config::Save() const {
       ";   to the screen before starting the next, so none wait in a queue. Only\n"
       ";   applies while VSync is on or adaptive. 0 = off (default).\n");
     fprintf(f, "low_latency = %d\n\n", lowLatency ? 1 : 0);
+    P("; profile: a preset for the three settings below. 0 = manual (default), 1 =\n"
+      ";   performance (the R36S: antialiasing off, anisotropy off, render scale 100%),\n"
+      ";   2 = quality (the desktop defaults: antialiasing 4x, anisotropy 8x). The\n"
+      ";   preset sets the values when the game starts; choose manual to keep your own.\n");
+    fprintf(f, "profile = %d\n\n", graphicsProfile);
     P("; msaa: antialiasing (smooth polygon edges). 0 = off, 2, 4 (default), 8 or 16.\n"
       ";   Values above what your graphics card supports are lowered automatically.\n");
     fprintf(f, "msaa = %d\n\n", msaa);

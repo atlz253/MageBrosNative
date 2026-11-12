@@ -8,6 +8,7 @@
 
 class Device;
 class Texture;
+class MeshBuffer;
 
 struct MeshMaterialData {
     D3DMATERIAL7 mtrl{};
@@ -19,6 +20,9 @@ struct MeshMaterialData {
 class CD3DFileObject {
 public:
     explicit CD3DFileObject(const std::string& name);
+    ~CD3DFileObject();
+    // Vertices changed (Scale, Shift, RotateX, a mod replacement): upload them again next draw.
+    void InvalidateMesh();
     // white: draw every material with the white material (the damage flash), as the game's
     // CD3DFileObject::Render(dev, alpha, white)
     void Render(Device* dev, bool alpha, bool white = false);
@@ -31,6 +35,9 @@ public:
     DWORD numMaterials = 0;
     bool hasAlpha = false;
     std::vector<std::unique_ptr<CD3DFileObject>> children;  // child list (m_pChild + m_pNext chain)
+
+private:
+    std::unique_ptr<MeshBuffer> meshBuffer_;  // created on the first draw
 };
 
 class CD3DFile {

@@ -7,6 +7,7 @@
 #include "framework/d3dutil.h"
 #include "game/JModel.h"
 #include "gfx/device.h"
+#include "gfx/mesh_buffer.h"
 #include <cstdio>
 
 namespace {
@@ -106,6 +107,8 @@ bool XLevelView::Load(int world, int level) {
     level_ = level;
     grid_ = std::move(g);
     geo_ = MapGeometry::Build(grid_);
+    floorBuffer_.reset();
+    undergroundBuffer_.reset();
     collision_ = MapCollision(geo_.cells, grid_.depth);
     floorTexture_ = kFloorTexture[world];
     undergroundTexture_ = kUndergroundTexture[world];
@@ -136,6 +139,8 @@ void XLevelView::FilterMarkers(const std::function<bool(const Object&)>& keep) {
 void XLevelView::BuildMarkers(const std::function<bool(const Object&)>& keep) {
     goalPads_ = MapGeometry::Mesh();
     markers_ = MapGeometry::Mesh();
+    goalBuffer_.reset();
+    markerBuffer_.reset();
     for (const auto& o : objects_) {
         if (keep && o.kind != Kind::Goal && !keep(o)) continue;
         if (o.kind == Kind::Goal) {
@@ -157,11 +162,12 @@ int XLevelView::FloorAt(float x, float z) const {
                                    (int)(z / MapGeometry::kCellSize));
 }
 
-void XLevelView::DrawMesh(Device* d, const MapGeometry::Mesh& m, uint16_t texture) {
+void XLevelView::DrawMesh(Device* d, MapGeometry::Mesh& m, std::unique_ptr<MeshBuffer>& buffer, uint16_t texture) {
     if (m.vertices.empty()) return;
+    if (!buffer) buffer = std::make_unique<MeshBuffer>();
     d->SetTexture(0, texture ? D3DTextr_GetSurface(texture) : nullptr);
-    d->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, D3DFVF_LVERTEX, m.vertices.data(), (DWORD)m.vertices.size(),
-                            m.indices.data(), (DWORD)m.indices.size(), 0);
+    d->DrawMesh(*buffer, D3DFVF_LVERTEX, m.vertices.data(), (DWORD)m.vertices.size(), m.indices.data(),
+                (DWORD)m.indices.size(), 0, (DWORD)m.indices.size());
 }
 
 void XLevelView::Render(Device* d, bool drawObjects) {
@@ -173,10 +179,10 @@ void XLevelView::Render(Device* d, bool drawObjects) {
     // pre-lit geometry (D3DLVERTEX), as the original draws its merged map meshes
     d->SetRenderState(D3DRENDERSTATE_LIGHTING, 0);
     d->SetRenderState(D3DRENDERSTATE_CULLMODE, D3DCULL_NONE);
-    DrawMesh(d, geo_.floorMesh, floorTexture_);
-    DrawMesh(d, geo_.undergroundMesh, undergroundTexture_);
-    DrawMesh(d, goalPads_, kGoalTexture);
-    DrawMesh(d, markers_, 0);
+    DrawMesh(d, geo_.floorMesh, floorBuffer_, floorTexture_);
+    DrawMesh(d, geo_.undergroundMesh, undergroundBuffer_, undergroundTexture_);
+    DrawMesh(d, goalPads_, goalBuffer_, kGoalTexture);
+    DrawMesh(d, markers_, markerBuffer_, 0);
     d->SetTexture(0, nullptr);
 
     // objects with real models

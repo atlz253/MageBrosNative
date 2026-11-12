@@ -513,11 +513,23 @@ void CD3DApplication::UpdateStats() {
     // (in whole milliseconds: as seconds in a float the time loses precision over a long session,
     // and JudgeVSync compares the rate to within half a percent)
     DWORD t = AppTimeMs();
+    const Device::FrameCounters& work = GetDevice().Counters();
+    statsWin_.drawSum += (double)work.draws;
+    statsWin_.glCallSum += (double)work.glCalls;
+    statsWin_.uploadSum += (double)work.uploadedBytes;
+    statsWin_.workFrames++;
+    statsWin_.tickSum += frameTickMs_;
+    statsWin_.renderSum += frameRenderMs_;
+    statsWin_.timeFrames++;
     statsFrames_++;
     if (t - statsLastTime_ > 1000) {
         m_fFPS = statsFrames_ * 1000.f / (float)(t - statsLastTime_);
         g_frameRate = m_fFPS;
         SummarizeStats(t - statsLastTime_);
+        const StatsSecond& s = statsSec_;
+        Log("Frame work: %.1f draws, %.0f GL calls, %.1f KB uploaded, %.2f ms logic, %.2f ms render, "
+            "%.2f ms CPU, %.2f ms swap, %.2f ms GPU, %.1f FPS",
+            s.draws, s.glCalls, s.uploadKB, s.tick, s.render, s.cpu, s.swap, s.gpu, s.fps);
         statsFrames_ = 0;
         statsLastTime_ = t;
         UpdateRefreshRate();  // (the window may have been moved to another monitor)
@@ -568,6 +580,11 @@ void CD3DApplication::SummarizeStats(DWORD elapsedMs) {
     s.cpu = w.swaps ? w.cpuSum / w.swaps : 0;
     s.swap = w.swaps ? w.swapSum / w.swaps : 0;
     s.gpu = w.gpuWaits ? w.gpuSum / w.gpuWaits : -1;
+    s.draws = w.workFrames ? w.drawSum / w.workFrames : 0;
+    s.glCalls = w.workFrames ? w.glCallSum / w.workFrames : 0;
+    s.uploadKB = w.workFrames ? w.uploadSum / w.workFrames / 1024.0 : 0;
+    s.tick = w.timeFrames ? w.tickSum / w.timeFrames : 0;
+    s.render = w.timeFrames ? w.renderSum / w.timeFrames : 0;
     s.ticksPerSecond = elapsedMs ? (int)std::lround(w.ticks * 1000.0 / elapsedMs) : 0;
     int drawn = w.tickFrames[0] + w.tickFrames[1] + w.tickFrames[2];
     for (int i = 0; i < 3; i++) s.tickPct[i] = drawn ? (int)std::lround(w.tickFrames[i] * 100.0 / drawn) : 0;
@@ -615,10 +632,15 @@ void CD3DApplication::DrawStatsOverlay() {
     perf.rows.push_back({"Frame avg", s.valid ? ms(s.frameAvg) : wait});
     snprintf(b, sizeof b, "%.2f-%.2f ms", s.frameMin, s.frameMax);
     perf.rows.push_back({"Frame range", s.valid ? std::string(b) : wait});
+    perf.rows.push_back({"Logic", s.valid ? ms(s.tick) : wait});
+    perf.rows.push_back({"Render", s.valid ? ms(s.render) : wait});
     perf.rows.push_back({"CPU", s.valid ? ms(s.cpu) : wait});
     perf.rows.push_back({"Swap wait", s.valid ? ms(s.swap) : wait});
     if (s.gpu >= 0) perf.rows.push_back({"GPU wait", ms(s.gpu)});
     else perf.rows.push_back({"GPU wait", "- (Low lat.)", true});
+    perf.rows.push_back({"Draw calls", s.valid ? num("%.1f", s.draws) : wait});
+    perf.rows.push_back({"GL calls", s.valid ? num("%.0f", s.glCalls) : wait});
+    perf.rows.push_back({"Uploaded", s.valid ? num("%.1f KB", s.uploadKB) : wait});
 
     StatsGroup timing{"GAME TIMING", {}};
     timing.rows.push_back({"Ticks/s", s.valid ? std::to_string(s.ticksPerSecond) : wait});
@@ -662,6 +684,8 @@ void CD3DApplication::DrawStatsOverlay() {
         else disp.rows.push_back({"Frame limit", num("%.1f ", lim) + (SwapPaced() ? "driver" : "limiter")});
         disp.rows.push_back({"Low latency", cfg.lowLatency ? (vsyncInEffect_ > 0 ? "On" : "On (no VSync)") : "Off"});
         disp.rows.push_back({"Smooth motion", cfg.interpolation ? "On" : "Off"});
+        disp.rows.push_back({"Profile", cfg.graphicsProfile == 1 ? "Performance"
+                                      : cfg.graphicsProfile == 2 ? "Quality" : "Manual"});
 
         StatsGroup sys{"SYSTEM", {}};
         sys.rows.push_back({"", d.GLRenderer()});
@@ -776,12 +800,15 @@ HRESULT CD3DApplication::Render3DEnvironment(DWORD now, bool forceRender) {
         heldLastFrame_ = true;
         StatsFrameStart(nowNs, 0, false);
         StatsFrameAlpha(GetConfig().interpolation ? g_tickAlpha : 1.f);
+        frameTickMs_ = 0;
+        uint64_t renderStart = AppTimeNs();
         GetDevice().BeginFrame();
         HRESULT hr = Render();
+        frameRenderMs_ = (double)(AppTimeNs() - renderStart) / 1e6;
         if (FAILED(hr)) return hr;
+        UpdateStats();
         DrawStatsOverlay();
         menu_->Render(&GetDevice());
-        UpdateStats();
         GetDevice().Present();
         SwapFrame();
         return S_OK;
@@ -796,6 +823,7 @@ HRESULT CD3DApplication::Render3DEnvironment(DWORD now, bool forceRender) {
     uint64_t elapsed = tickNow > lastTickNs_ ? tickNow - lastTickNs_ : 0;
     DWORD ticks = (DWORD)(elapsed / kTickNs);
     if (ticks == 0 && !forceRender) return S_OK;
+    uint64_t tickStart = AppTimeNs();
     DWORD ran = 0;
     if (ticks > 0) {
         SetLastTick(tickNow - elapsed % kTickNs);
@@ -817,11 +845,14 @@ HRESULT CD3DApplication::Render3DEnvironment(DWORD now, bool forceRender) {
         g_tickAlpha = 1.f;
     }
     StatsFrameAlpha(GetConfig().interpolation ? g_tickAlpha : 1.f);  // (the blend this frame is drawn at)
+    uint64_t renderStart = AppTimeNs();
+    frameTickMs_ = (double)(renderStart - tickStart) / 1e6;
     GetDevice().BeginFrame();
     HRESULT hr = Render();
+    frameRenderMs_ = (double)(AppTimeNs() - renderStart) / 1e6;
     if (FAILED(hr)) return hr;
-    DrawStatsOverlay();
     UpdateStats();
+    DrawStatsOverlay();
     GetDevice().Present();
     SwapFrame();
     return S_OK;

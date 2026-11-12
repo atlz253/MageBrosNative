@@ -182,6 +182,10 @@ private:
         int tickFrames[3] = {0, 0, 0};  // frames that ran 0, 1, 2 or more ticks
         double lateSum = 0, lateMax = 0;  // ms, Smooth motion off: a frame's start after its tick
         int lateFrames = 0;
+        double drawSum = 0, glCallSum = 0, uploadSum = 0;  // the renderer's work, per frame
+        int workFrames = 0;
+        double tickSum = 0, renderSum = 0;  // ms spent in FrameMove and Render
+        int timeFrames = 0;
     } statsWin_;
     struct StatsSecond {  // the last second, as shown
         bool valid = false;
@@ -197,7 +201,10 @@ private:
         double gpuAO = -1;  // the graphics card's time for ambient occlusion a frame (-1: none)
         double gpuShadows = -1;  // the same for the dynamic shadows' map
         double gpuBloom = -1;    // and for the bloom's blur (G6)
+        double draws = 0, glCalls = 0, uploadKB = 0;  // averaged over the second
+        double tick = 0, render = 0;                  // ms a frame, averaged
     } statsSec_;
+    double frameTickMs_ = 0, frameRenderMs_ = 0;  // the frame just drawn, before UpdateStats
     uint64_t frameStartNs_ = 0;
     // The last frames drawn, for the overlay's graphs (O2): the time since the frame before, the
     // blend it was drawn at (1 with Smooth motion off) and the ticks it ran. Kept whether the
