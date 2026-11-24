@@ -818,6 +818,10 @@ bool Device::Init(SDL_Window* window) {
     glVersion_ = glStr(GL_VERSION);
     glGetIntegerv(GL_SAMPLES, &windowSamples_);
     Log("Window framebuffer: MSAA %dx", windowSamples_);
+    GLint maxRb = 0, maxTex = 0;
+    glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &maxRb);
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTex);
+    Log("Limits: renderbuffer %d, texture %d", (int)maxRb, (int)maxTex);
     Log("OpenGL vendor: %s", glVendor_.c_str());
 #if defined(MBN_GLES)
     Log("Renderer backend: gles");
@@ -1037,7 +1041,9 @@ void Device::ComputeLayout() {
     float s = cfg.renderScale;
     L.fboW = std::max(1, (int)(L.destW * s + 0.5f));
     L.fboH = std::max(1, (int)(L.destH * s + 0.5f));
-    GLint maxRb = 8192;
+    GLint maxRb = 0;
+    glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &maxRb);
+    if (maxRb < 1) maxRb = 8192;  // (a driver that will not say: the old fixed cap)
     L.fboW = std::min(L.fboW, (int)maxRb);
     L.fboH = std::min(L.fboH, (int)maxRb);
     bool changed = L.fboW != layout_.fboW || L.fboH != layout_.fboH || !sceneFbo_ ||
@@ -1050,10 +1056,15 @@ void Device::ComputeLayout() {
 
 bool Device::WantsDirectWindow() const {
 #if defined(MBN_GLES)
+#if defined(__ANDROID__)
+    // Always through the off-screen target: one path on every Android driver.
+    return false;
+#else
     const Config& cfg = GetConfig();
     return windowSamples_ == cfg.msaa && cfg.renderScale == 1.f && cfg.bloom == 0 && cfg.brightness == 100 &&
            layout_.destX == 0 && layout_.destY == 0 && layout_.destW == layout_.windowW &&
            layout_.destH == layout_.windowH;
+#endif
 #else
     return false;
 #endif

@@ -2,6 +2,12 @@ cmake_minimum_required(VERSION 3.20)
 # The project version is the single source of the program's version number.
 project(MageBrosNative VERSION 0.4.47 LANGUAGES C CXX)
 
+# Android is built by Gradle/NDK: it has no desktop GL and no separate install step.
+if(ANDROID)
+  set(MBN_GLES ON CACHE BOOL "" FORCE)
+  set(MBN_SDL_FROM_SOURCE OFF CACHE BOOL "" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -12,7 +18,8 @@ endif()
 # mbn_core: reading the user's MageBros.exe (PE resources, bitmaps, sounds, .x models, levels).
 # No SDL dependency, so the tools and tests build anywhere.
 set(MBN_CORE_SOURCES
-  src/core/benchmark_level.cpp src/core/game_files.cpp src/core/image.cpp src/core/level.cpp src/core/log.cpp
+  src/core/benchmark_level.cpp src/core/game_files.cpp src/core/image.cpp src/core/import_names.cpp
+  src/core/level.cpp src/core/log.cpp src/core/touch_curve.cpp src/core/touch_layout.cpp
   src/core/pe_resources.cpp src/core/sha256.cpp src/core/wave.cpp src/core/xfile.cpp)
 add_library(mbn_core STATIC ${MBN_CORE_SOURCES})
 target_include_directories(mbn_core PUBLIC src)
@@ -31,6 +38,7 @@ if(MINGW)
 endif()
 
 # MageBrosAssets: inventory, self-test and asset export for the user's own copy.
+if(NOT ANDROID)
 add_executable(MageBrosAssets tools/mbn_assets.cpp)
 target_link_libraries(MageBrosAssets PRIVATE mbn_core)
 
@@ -39,6 +47,16 @@ enable_testing()
 add_executable(mbn_tests tests/format_tests.cpp)
 target_link_libraries(mbn_tests PRIVATE mbn_core)
 add_test(NAME formats COMMAND mbn_tests)
+
+# The Android import's file-name rules, kept in the shared core so the host can test them.
+add_executable(mbn_import_tests tests/import_tests.cpp)
+target_link_libraries(mbn_import_tests PRIVATE mbn_core)
+add_test(NAME import_names COMMAND mbn_import_tests)
+
+# The touch overlay's stick curve, coordinate mapping and hit rules.
+add_executable(mbn_touch_tests tests/touch_tests.cpp)
+target_link_libraries(mbn_touch_tests PRIVATE mbn_core)
+add_test(NAME touch_controls COMMAND mbn_touch_tests)
 
 # The generated benchmark level: valid rows, a dense mix and buildable geometry, with no game
 # files needed. It is the first half of the R36S performance acceptance (docs/…).
@@ -90,16 +108,19 @@ if(MBN_GAME_EXE)
   add_test(NAME map_geometry COMMAND mbn_map_tests --game ${MBN_GAME_EXE})
   add_test(NAME hero_movement COMMAND mbn_hero_tests --game ${MBN_GAME_EXE})
 endif()
+endif()  # NOT ANDROID (tools and tests)
 
 # ---------------------------------------------------------------------------------------------
 # ColDet, the collision library the original game was built with (LGPL-2.0-or-later, its own
 # license in third_party/coldet). Built from its published source when that folder is present.
 if(EXISTS ${CMAKE_SOURCE_DIR}/third_party/coldet/CMakeLists.txt)
   add_subdirectory(third_party/coldet)
-  add_executable(mbn_collision_tests tests/collision_tests.cpp)
-  target_link_libraries(mbn_collision_tests PRIVATE coldet)
-  add_test(NAME collision COMMAND mbn_collision_tests)
-  install(TARGETS mbn_collision_tests RUNTIME DESTINATION .)
+  if(NOT ANDROID)
+    add_executable(mbn_collision_tests tests/collision_tests.cpp)
+    target_link_libraries(mbn_collision_tests PRIVATE coldet)
+    add_test(NAME collision COMMAND mbn_collision_tests)
+    install(TARGETS mbn_collision_tests RUNTIME DESTINATION .)
+  endif()
 endif()
 
 # ---------------------------------------------------------------------------------------------
@@ -124,29 +145,47 @@ option(MBN_FETCH_SDL "Download and build SDL3 if it is not installed" ON)
 option(MBN_SDL_FROM_SOURCE "Build the pinned SDL3 from source even if a system one is installed" OFF)
 
 if(MBN_BUILD_GAME)
-  if(NOT MBN_SDL_FROM_SOURCE)
-    find_package(SDL3 CONFIG QUIET)
-  endif()
-  if(SDL3_FOUND)
-    # say which SDL the build will use: the platform ports differ in how they get it
-    message(STATUS "SDL3: system package at ${SDL3_DIR}")
-  endif()
-  if(NOT SDL3_FOUND)
-    if(MBN_FETCH_SDL)
-      message(STATUS "SDL3: building release-3.4.18 from source")
-      include(FetchContent)
-      set(SDL_SHARED OFF CACHE BOOL "" FORCE)
-      set(SDL_STATIC ON CACHE BOOL "" FORCE)
-      set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
-      set(SDL_TESTS OFF CACHE BOOL "" FORCE)
-      set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
-      FetchContent_Declare(SDL3
-        GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-        GIT_TAG release-3.4.18
-        GIT_SHALLOW TRUE)
-      FetchContent_MakeAvailable(SDL3)
-    else()
-      message(FATAL_ERROR "SDL3 not found. Install it or enable MBN_FETCH_SDL.")
+  if(ANDROID)
+    # Gradle fetches the pinned SDL3 source (android/fetch-sdl.sh); the same tree supplies the
+    # Java shim the activity is built against. A shared SDL3 is required on Android.
+    if(NOT MBN_SDL_SOURCE_DIR)
+      set(MBN_SDL_SOURCE_DIR "${CMAKE_SOURCE_DIR}/android/app/jni/SDL" CACHE PATH "SDL3 source for Android")
+    endif()
+    if(NOT EXISTS "${MBN_SDL_SOURCE_DIR}/CMakeLists.txt")
+      message(FATAL_ERROR "SDL3 source not found at ${MBN_SDL_SOURCE_DIR}. Run android/fetch-sdl.sh first.")
+    endif()
+    message(STATUS "SDL3: building from ${MBN_SDL_SOURCE_DIR}")
+    set(SDL_SHARED ON CACHE BOOL "" FORCE)
+    set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+    set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+    set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+    set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${MBN_SDL_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/sdl")
+  else()
+    if(NOT MBN_SDL_FROM_SOURCE)
+      find_package(SDL3 CONFIG QUIET)
+    endif()
+    if(SDL3_FOUND)
+      # say which SDL the build will use: the platform ports differ in how they get it
+      message(STATUS "SDL3: system package at ${SDL3_DIR}")
+    endif()
+    if(NOT SDL3_FOUND)
+      if(MBN_FETCH_SDL)
+        message(STATUS "SDL3: building release-3.4.18 from source")
+        include(FetchContent)
+        set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+        set(SDL_STATIC ON CACHE BOOL "" FORCE)
+        set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+        set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+        set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+        FetchContent_Declare(SDL3
+          GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+          GIT_TAG release-3.4.18
+          GIT_SHALLOW TRUE)
+        FetchContent_MakeAvailable(SDL3)
+      else()
+        message(FATAL_ERROR "SDL3 not found. Install it or enable MBN_FETCH_SDL.")
+      endif()
     endif()
   endif()
 
@@ -159,11 +198,20 @@ if(MBN_BUILD_GAME)
   # source, and a compiler that picks them up fails with a screenful of nonsense
   list(FILTER MBN_GAME_SOURCES EXCLUDE REGEX "/\\._[^/]*$")
   list(APPEND MBN_GAME_SOURCES
-    src/main.cpp src/core/assets.cpp src/core/config.cpp src/core/mods.cpp src/core/saves.cpp
-    src/core/third_party_impl.cpp)
-  if(WIN32)
+    src/main.cpp src/core/assets.cpp src/core/app_paths.cpp src/core/config.cpp src/core/mods.cpp
+    src/core/platform_actions.cpp src/core/saves.cpp src/core/third_party_impl.cpp)
+  if(ANDROID)
+    # The launcher's verification call lives in libmain.so as well.
+    list(APPEND MBN_GAME_SOURCES src/android/verify_jni.cpp)
+  endif()
+  if(ANDROID)
+    # SDL's Android activity loads "main" and calls the SDL_main this shared library exports.
+    add_library(main SHARED ${MBN_GAME_SOURCES})
+    set(MBN_GAME_TARGET main)
+  elseif(WIN32)
     # the icon and version information (res/magebros_native.rc)
     add_executable(MageBrosNative WIN32 ${MBN_GAME_SOURCES} res/magebros_native.rc)
+    set(MBN_GAME_TARGET MageBrosNative)
     # the resource compiler doesn't track header changes: rebuild the version info when it changes
     set_source_files_properties(res/magebros_native.rc PROPERTIES OBJECT_DEPENDS ${CMAKE_BINARY_DIR}/generated/version.h)
     if(MINGW)
@@ -177,10 +225,11 @@ if(MBN_BUILD_GAME)
     else()
       add_executable(MageBrosNative ${MBN_GAME_SOURCES})
     endif()
+    set(MBN_GAME_TARGET MageBrosNative)
   endif()
   configure_file(res/version.h.in ${CMAKE_BINARY_DIR}/generated/version.h @ONLY)
   if(APPLE)
-    set_target_properties(MageBrosNative PROPERTIES
+    set_target_properties(${MBN_GAME_TARGET} PROPERTIES
       MACOSX_BUNDLE_BUNDLE_NAME MageBrosNative
       MACOSX_BUNDLE_GUI_IDENTIFIER com.magebros.native
       MACOSX_BUNDLE_BUNDLE_VERSION ${PROJECT_VERSION}
@@ -188,39 +237,49 @@ if(MBN_BUILD_GAME)
       MACOSX_BUNDLE_INFO_PLIST ${CMAKE_SOURCE_DIR}/res/Info.plist.in)
     # Music through the platform's General MIDI synthesizer (the Apple DLS synth), used when no
     # SoundFont is installed.
-    target_link_libraries(MageBrosNative PRIVATE
+    target_link_libraries(${MBN_GAME_TARGET} PRIVATE
       "-framework AudioToolbox" "-framework AudioUnit" "-framework CoreAudio")
   endif()
-  target_include_directories(MageBrosNative PRIVATE src third_party ${CMAKE_BINARY_DIR}/generated)
-  target_link_libraries(MageBrosNative PRIVATE mbn_core)
+  target_include_directories(${MBN_GAME_TARGET} PRIVATE src third_party ${CMAKE_BINARY_DIR}/generated)
+  target_link_libraries(${MBN_GAME_TARGET} PRIVATE mbn_core)
   if(TARGET coldet)
-    target_link_libraries(MageBrosNative PRIVATE coldet)
+    target_link_libraries(${MBN_GAME_TARGET} PRIVATE coldet)
   endif()
   if(TARGET SDL3::SDL3)
-    target_link_libraries(MageBrosNative PRIVATE SDL3::SDL3)
+    target_link_libraries(${MBN_GAME_TARGET} PRIVATE SDL3::SDL3)
   else()
-    target_link_libraries(MageBrosNative PRIVATE SDL3::SDL3-static)
+    target_link_libraries(${MBN_GAME_TARGET} PRIVATE SDL3::SDL3-static)
   endif()
   if(WIN32)
-    target_link_libraries(MageBrosNative PRIVATE winmm)
+    target_link_libraries(${MBN_GAME_TARGET} PRIVATE winmm)
+  elseif(ANDROID)
+    target_link_libraries(${MBN_GAME_TARGET} PRIVATE m)
+    # 16 KB page-size devices (Android 15 and newer) are part of the supported range.
+    target_link_options(${MBN_GAME_TARGET} PRIVATE
+      "-Wl,-z,max-page-size=16384"
+      "-Wl,--undefined=Java_com_magebros_game_GameFilesActivity_nativeVerifyExecutable"
+      "-Wl,--undefined=Java_com_magebros_game_GameFilesActivity_nativeTargetName"
+      "-Wl,--undefined=Java_com_magebros_game_MageBrosActivity_nativeBack")
   elseif(NOT APPLE)
-    target_link_libraries(MageBrosNative PRIVATE m pthread)
+    target_link_libraries(${MBN_GAME_TARGET} PRIVATE m pthread)
     # Keep the release tarball independent of the builder's GLIBCXX/libgcc versions.
-    target_link_options(MageBrosNative PRIVATE -static-libstdc++ -static-libgcc)
+    target_link_options(${MBN_GAME_TARGET} PRIVATE -static-libstdc++ -static-libgcc)
   endif()
   if(MSVC)
     # main() entry point in a Windows GUI program
-    target_link_options(MageBrosNative PRIVATE /ENTRY:mainCRTStartup)
+    target_link_options(${MBN_GAME_TARGET} PRIVATE /ENTRY:mainCRTStartup)
   endif()
-  if(APPLE)
-    install(TARGETS MageBrosNative BUNDLE DESTINATION .)
-  else()
-    install(TARGETS MageBrosNative RUNTIME DESTINATION .)
+  if(NOT ANDROID)
+    if(APPLE)
+      install(TARGETS MageBrosNative BUNDLE DESTINATION .)
+    else()
+      install(TARGETS MageBrosNative RUNTIME DESTINATION .)
+    endif()
   endif()
 
   # The R36S platform probe: does SDL3's KMSDRM video, GLES context, ALSA and gamepad work on
   # this device? A development tool, never packaged with the game.
-  if(MBN_BUILD_R36S_PROBE)
+  if(MBN_BUILD_R36S_PROBE AND NOT ANDROID)
     add_executable(mbn_r36s_probe tools/r36s/probe.cpp src/gfx/gl.cpp src/core/log.cpp)
     target_include_directories(mbn_r36s_probe PRIVATE src third_party)
     target_link_libraries(mbn_r36s_probe PRIVATE mbn_core)
@@ -237,6 +296,8 @@ endif()
 
 # ---------------------------------------------------------------------------------------------
 # Release package: `cmake --build build --config Release --target package` (or make_release.bat)
+# Android is packaged by Gradle, not by CMake/CPack.
+if(NOT ANDROID)
 install(TARGETS MageBrosAssets mbn_tests mbn_soundfont_tests RUNTIME DESTINATION .)
 install(FILES README.md LICENSE THIRD_PARTY_NOTICES.md DESTINATION .)
 # The bundled General MIDI bank: beside the program on Windows/Linux, in the bundle's Resources
@@ -271,3 +332,4 @@ if(UNIX AND NOT APPLE)
   set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY ON)
 endif()
 include(CPack)
+endif()  # NOT ANDROID

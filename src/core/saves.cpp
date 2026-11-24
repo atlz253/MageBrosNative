@@ -1,4 +1,5 @@
 #include "saves.h"
+#include "app_paths.h"
 #include "config.h"
 #include "log.h"
 #include <SDL3/SDL.h>
@@ -56,6 +57,11 @@ std::string ExpandVars(const std::string& in) {
 
 // The standard per-user data folder for this program (created if missing), or "" if unavailable.
 std::string PrefPath() {
+#if defined(__ANDROID__)
+    // One folder for everything, as on macOS; the Android path is chosen in core/app_paths.
+    const std::string root = AppPaths::DataRoot();
+    if (!root.empty()) return root;
+#endif
     char* p = SDL_GetPrefPath("", kAppFolder);
     std::string s = p ? p : "";
     SDL_free(p);

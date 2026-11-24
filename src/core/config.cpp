@@ -116,6 +116,11 @@ bool Config::Load(const std::string& file) {
             else seen = before;
         } else if (section == "input") {
             if (k == "gamepad_deadzone") gamepadDeadzone = std::clamp(iv, 0, 90);
+            else if (k == "touch_controls") {
+                std::string l = v;
+                for (auto& c : l) c = (char)tolower((unsigned char)c);
+                touchControls = (l == "on" || l == "2") ? 2 : (l == "off" || l == "0") ? 0 : 1;
+            }
             else seen = before;
         } else if (section == "keys") {
             // dik_<hex or dec> = Scancode name list
@@ -433,7 +438,11 @@ bool Config::Save() const {
     P("[input]\n"
       "; gamepad_deadzone: how far (percent) an analog stick must move before it\n"
       ";   counts. 0 to 90, default 25. Raise it if your character drifts.\n");
-    fprintf(f, "gamepad_deadzone = %d\n\n", gamepadDeadzone);
+    fprintf(f, "gamepad_deadzone = %d\n", gamepadDeadzone);
+    P("; touch_controls: off, automatic or on. Automatic shows the on-screen stick and\n"
+      ";   buttons on a touch screen, and they hide while a physical gamepad is\n"
+      ";   connected (which then controls player 1).\n");
+    fprintf(f, "touch_controls = %s\n\n", touchControls == 0 ? "off" : touchControls == 2 ? "on" : "automatic");
 
     P("[keys]\n"
       "; Key remapping. Format:  dik_<code> = <key>[, <key>, ...]\n"

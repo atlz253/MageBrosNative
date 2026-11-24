@@ -238,6 +238,62 @@ void UIDraw::Rect(float x0, float y0, float x1, float y1, UIColor c) {
     dev_->DrawUIQuad(x0, y0, x1, y1, 0, 0, 0, 0, nullptr, rgba);
 }
 
+namespace {
+uint32_t PackColor(UIColor c) {
+    auto b = [](float f) { return (uint32_t)(std::min(1.f, std::max(0.f, f)) * 255.f + 0.5f); };
+    return b(c.a) << 24 | b(c.r) << 16 | b(c.g) << 8 | b(c.b);
+}
+
+void Triangle(std::vector<D3DLVERTEX>& to, float x0, float y0, float x1, float y1, float x2, float y2,
+              uint32_t color) {
+    D3DLVERTEX v[3];
+    memset(v, 0, sizeof v);
+    v[0].x = x0; v[0].y = y0;
+    v[1].x = x1; v[1].y = y1;
+    v[2].x = x2; v[2].y = y2;
+    for (auto& q : v) q.color = color;
+    for (int i = 0; i < 3; i++) to.push_back(v[i]);
+}
+}  // namespace
+
+void UIDraw::Disc(float cx, float cy, float radius, UIColor c, int segments) {
+    if (!dev_ || radius <= 0 || segments < 3) return;
+    const uint32_t color = PackColor(c);
+    std::vector<D3DLVERTEX> tris;
+    tris.reserve((size_t)segments * 3);
+    for (int i = 0; i < segments; i++) {
+        float a0 = 6.2831853f * i / segments, a1 = 6.2831853f * (i + 1) / segments;
+        Triangle(tris, cx, cy, cx + std::cos(a0) * radius, cy + std::sin(a0) * radius,
+                 cx + std::cos(a1) * radius, cy + std::sin(a1) * radius, color);
+    }
+    if (batching_) {
+        rects_.insert(rects_.end(), tris.begin(), tris.end());
+        return;
+    }
+    dev_->DrawUIQuads(tris, nullptr);
+}
+
+void UIDraw::Ring(float cx, float cy, float outer, float inner, UIColor c, int segments) {
+    if (!dev_ || outer <= inner || segments < 3) return;
+    const uint32_t color = PackColor(c);
+    std::vector<D3DLVERTEX> tris;
+    tris.reserve((size_t)segments * 6);
+    for (int i = 0; i < segments; i++) {
+        float a0 = 6.2831853f * i / segments, a1 = 6.2831853f * (i + 1) / segments;
+        float o0x = cx + std::cos(a0) * outer, o0y = cy + std::sin(a0) * outer;
+        float o1x = cx + std::cos(a1) * outer, o1y = cy + std::sin(a1) * outer;
+        float i0x = cx + std::cos(a0) * inner, i0y = cy + std::sin(a0) * inner;
+        float i1x = cx + std::cos(a1) * inner, i1y = cy + std::sin(a1) * inner;
+        Triangle(tris, o0x, o0y, o1x, o1y, i1x, i1y, color);
+        Triangle(tris, o0x, o0y, i1x, i1y, i0x, i0y, color);
+    }
+    if (batching_) {
+        rects_.insert(rects_.end(), tris.begin(), tris.end());
+        return;
+    }
+    dev_->DrawUIQuads(tris, nullptr);
+}
+
 void UIDraw::Text(float x, float y, const std::string& s, float scale, UIColor c, bool shadow) {
     if (shadow) Text(x + scale, y + scale, s, scale, UIColor{0, 0, 0, c.a * 0.7f}, false);
     float g = 8.f * scale;

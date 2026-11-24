@@ -5,11 +5,13 @@
 #include "../core/config.h"
 #include "../core/log.h"
 #include "../core/mods.h"
+#include "../core/platform_actions.h"
 #include "../framework/d3dapp.h"
 #include "../framework/d3dtextr.h"
 #include "../gfx/device.h"
 #include "version.h"
 #include "../input/input.h"
+#include "../input/touch_controls.h"
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <cstring>
@@ -446,6 +448,10 @@ OptionsMenu::Page OptionsMenu::MainPage() {
                        [this] { PushPage(AudioPage()); }, nullptr});
     p.items.push_back({"Controls", "Keyboard and gamepad bindings, stick dead zone.", nullptr, nullptr,
                        [this] { PushPage(ControlsPage()); }, nullptr});
+    if (PlatformActions::CanImportGameFiles())
+        p.items.push_back({"Game files",
+                           "Choose the folder with MageBros.exe and its music; the next start uses them.",
+                           nullptr, nullptr, [] { PlatformActions::ImportGameFiles(); }, nullptr});
     p.items.push_back({"Cheats", "Game modifiers, all off by default.", nullptr, nullptr,
                        [this] { PushPage(CheatsPage()); }, nullptr});
     p.items.push_back({"Mods", "", nullptr, nullptr, [this] { PushPage(ModsPage()); }, nullptr});
@@ -831,6 +837,17 @@ OptionsMenu::Page OptionsMenu::VideoPage() {
                  },
                  nullptr, nullptr});
 
+    // Android has one screen and no window management: hide the rows it cannot honour.
+    if (!PlatformActions::CanManageWindows()) {
+        static const char* const hidden[] = {"Display mode", "Resolution", "Refresh rate", "Monitor", "VSync"};
+        v.erase(std::remove_if(v.begin(), v.end(),
+                               [&](const Item& item) {
+                                   for (const char* label : hidden)
+                                       if (item.label == label) return true;
+                                   return false;
+                               }),
+                v.end());
+    }
     v.push_back({"Back", "", nullptr, nullptr, [this] { Back(false); }, nullptr});
     return p;
 }
@@ -1038,6 +1055,20 @@ OptionsMenu::Page OptionsMenu::ControlsPage() {
                  [] { return std::to_string(GetConfig().gamepadDeadzone) + "%"; },
                  [this](int d) {
                      GetConfig().gamepadDeadzone = std::clamp(GetConfig().gamepadDeadzone + d * 5, 0, 90);
+                     Save();
+                 },
+                 [] {}, nullptr});
+    v.push_back({"Touch controls",
+                 "Show the on-screen stick and buttons. Automatic shows them on a touch screen; a "
+                 "physical gamepad hides them and controls player 1.",
+                 [] {
+                     int m = GetConfig().touchControls;
+                     return m == 0 ? std::string("Off") : m == 2 ? std::string("On") : std::string("Automatic");
+                 },
+                 [this](int d) {
+                     Config& c = GetConfig();
+                     c.touchControls = (c.touchControls + d + 3) % 3;
+                     TouchControls::SetMode(c.touchControls);
                      Save();
                  },
                  [] {}, nullptr});

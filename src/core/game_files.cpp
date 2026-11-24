@@ -1,4 +1,5 @@
 #include "game_files.h"
+#include "known_builds.h"
 #include "log.h"
 #include "sha256.h"
 #include <cctype>
@@ -11,12 +12,7 @@ PEResources g_res;
 bool g_open = false, g_verified = false;
 std::string g_exePath, g_gameDir, g_label;
 
-// Builds of MageBros.exe this port has been checked against (SHA-256 of the whole file).
-struct KnownBuild { const char* sha256; const char* label; };
-const KnownBuild kKnownBuilds[] = {
-    {"ac191080af002b8ad0615e432faa92a2a47ce76a9aaa667bacf628836c098c49",
-     "Mage Bros. 2.0 (2022 rebuild, freeware)"},
-};
+// Builds of MageBros.exe this port has been checked against are in known_builds.h.
 
 // GetMapResId(world, level) of the original, as a table. Level 9 of each world is its boss level.
 const uint16_t kLevelIds[GameFiles::kWorldCount][GameFiles::kLevelsPerWorld] = {
@@ -87,7 +83,7 @@ bool Open(const std::string& explicitPath, const std::string& programDir, bool a
     std::string hash = Sha256Hex(bytes.data(), bytes.size());
     g_verified = false;
     g_label = "unknown build";
-    for (const auto& kb : kKnownBuilds)
+    for (const auto& kb : KnownBuilds::kBuilds)
         if (hash == kb.sha256) { g_verified = true; g_label = kb.label; }
     Log("Game executable: %s", found.c_str());
     Log("SHA-256: %s (%s)", hash.c_str(), g_label.c_str());

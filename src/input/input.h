@@ -23,6 +23,7 @@ void SetFocus(bool focused);
 // Snapshot of the current state (what IDirectInputDevice::GetDeviceState returns)
 void GetKeyboardState(uint8_t out[256]);
 int NumJoysticks();
+int NumPhysicalPads();  // gamepads that are not the touch controller's virtual pad
 bool GetJoystickState(int index, DIJOYSTATE* out);
 
 // Buffered key presses (DIK codes) since the last call, like GetDeviceData

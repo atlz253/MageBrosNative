@@ -1,10 +1,12 @@
 #include "d3dapp.h"
 #include "interp.h"
 #include "d3dtextr.h"
+#include "../core/app_paths.h"
 #include "../core/config.h"
 #include "../core/log.h"
 #include "../gfx/device.h"
 #include "../input/input.h"
+#include "../input/touch_controls.h"
 #include "../audio/midi.h"
 #include "../ui/options_menu.h"
 #include "../ui/stats_overlay.h"
@@ -581,7 +583,13 @@ HRESULT CD3DApplication::Create(const std::vector<std::string>& args) {
     // off-screen target (measured: 60 vs 30 frames a second at 640x480, MSAA 4x). Only the direct
     // path uses the window's samples; a render scale or a fallback would otherwise pay for two
     // resolves.
+#if defined(__ANDROID__)
+    // Android drivers commonly ignore or overcharge for multi-sampled window surfaces: always
+    // render through the game's own target there.
+    const bool windowMsaa = false;
+#else
     bool windowMsaa = cfg.renderScale == 1.f && cfg.bloom == 0 && cfg.brightness == 100;
+#endif
     SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, windowMsaa && cfg.msaa > 1 ? 1 : 0);
     SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, windowMsaa ? cfg.msaa : 0);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
@@ -589,6 +597,13 @@ HRESULT CD3DApplication::Create(const std::vector<std::string>& args) {
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
 #endif
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 0);
+#if defined(__ANDROID__)
+    // The game is landscape-only; a saved portrait window must not decide the surface shape.
+    if (const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetPrimaryDisplay())) {
+        cfg.windowWidth = std::max(mode->w, mode->h);
+        cfg.windowHeight = std::min(mode->w, mode->h);
+    }
+#endif
     window_ = SDL_CreateWindow(m_strWindowTitle, cfg.windowWidth, cfg.windowHeight,
                                SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN);
     if (!window_) {
@@ -651,6 +666,17 @@ HRESULT CD3DApplication::Create(const std::vector<std::string>& args) {
 
 void CD3DApplication::Pause(bool pause) {
     (void)pause;  // nothing to do: after a long stop, XApplication::FrameMove takes at most 10 ticks and the rest are dropped
+}
+
+void CD3DApplication::OnBack() {
+    if (menu_ && menu_->IsOpen())
+        menu_->Close();
+    else
+        quit_ = true;
+}
+
+void CD3DApplication::CloseOptions() {
+    if (menu_ && menu_->IsOpen()) menu_->Close();
 }
 
 void CD3DApplication::UpdateStats() {
@@ -928,6 +954,7 @@ HRESULT CD3DApplication::Render3DEnvironment(DWORD now, bool forceRender) {
         if (FAILED(hr)) return hr;
         DrawStatsOverlay();
         DrawBenchmarkLabel();
+        TouchControls::Render(&GetDevice());
         menu_->Render(&GetDevice());
         UpdateStats();
         GetDevice().Present();
@@ -989,6 +1016,7 @@ HRESULT CD3DApplication::Render3DEnvironment(DWORD now, bool forceRender) {
     if (FAILED(hr)) return hr;
     DrawStatsOverlay();
     DrawBenchmarkLabel();
+    TouchControls::Render(&GetDevice());
     UpdateStats();
     GetDevice().Present();
     SwapFrame();
@@ -1026,6 +1054,17 @@ void CD3DApplication::HandleAutomation(DWORD now) {
             ev.type = SDL_EVENT_KEY_UP;
             ev.key.down = false;
             SDL_PushEvent(&ev);
+        } else if (s.action == "back") {
+            OnBack();
+            Log("auto: back");
+        } else if (s.action == "background" || s.action == "foreground") {
+            SDL_Event ev{};
+            ev.type = s.action == "background" ? SDL_EVENT_WILL_ENTER_BACKGROUND : SDL_EVENT_DID_ENTER_FOREGROUND;
+            SDL_PushEvent(&ev);
+        } else if (s.action == "active") {
+            SDL_Event ev{};
+            ev.type = SDL_EVENT_WINDOW_SHOWN;
+            SDL_PushEvent(&ev);
         } else if (s.action == "focus") {
             // test-only: simulate the window losing (focus=0) or regaining (focus=1) focus
             SDL_Event ev{};
@@ -1048,6 +1087,47 @@ void CD3DApplication::HandleAutomation(DWORD now) {
             int idx = atoi(s.arg.substr(0, c).c_str()), val = atoi(s.arg.substr(c + 1).c_str());
             if (s.action == "padaxis") SDL_SetJoystickVirtualAxis((SDL_Joystick*)autoPad_, idx, (Sint16)val);
             else SDL_SetJoystickVirtualButton((SDL_Joystick*)autoPad_, idx, val != 0);
+        } else if (s.action == "touchbtn" || s.action == "touchstick") {
+            // test-only: drive the touch controller's virtual pad directly
+            if (s.action == "touchbtn") {
+                size_t c = s.arg.find(':');
+                if (c != std::string::npos)
+                    TouchControls::SetButton(atoi(s.arg.substr(0, c).c_str()), atoi(s.arg.substr(c + 1).c_str()) != 0);
+            } else {
+                float x = 0, y = 0;
+                if (std::sscanf(s.arg.c_str(), "%f,%f", &x, &y) == 2) {
+                    TouchControls::SetStick(x, y);
+                    float ax = 0, ay = 0;
+                    TouchControls::Axis(&ax, &ay);
+                    Log("auto: touch stick %.2f,%.2f -> axis %.2f,%.2f", x, y, ax, ay);
+                }
+            }
+            DIJOYSTATE js{};
+            if (Input::NumJoysticks() > 0) Input::GetJoystickState(0, &js);
+            Log("auto: pad 0 buttons %d%d, start %d, stick %d,%d", js.rgbButtons[0] ? 1 : 0, js.rgbButtons[1] ? 1 : 0,
+                js.rgbButtons[6] ? 1 : 0, js.lX, js.lY);
+        } else if (s.action == "physicalpad") {
+            TouchControls::TestPhysicalPad(s.arg != "0");
+            Log("auto: physical pad %s; touch controls %s", s.arg != "0" ? "connected" : "disconnected",
+                TouchControls::Active() ? "shown" : "hidden");
+        } else if (s.action == "touchdown" || s.action == "touchmove" || s.action == "touchup") {
+            // test-only: the same finger path the SDL touch events use
+            uint64_t id = 0;
+            float x = 0, y = 0;
+            size_t colon = s.arg.find(':');
+            if (s.action == "touchup") {
+                id = std::strtoull(s.arg.c_str(), nullptr, 10);
+            } else if (colon != std::string::npos) {
+                id = std::strtoull(s.arg.substr(0, colon).c_str(), nullptr, 10);
+                std::sscanf(s.arg.substr(colon + 1).c_str(), "%f,%f", &x, &y);
+            }
+            TouchControls::HandleFinger(id, x, y, s.action == "touchdown", s.action == "touchup");
+            DIJOYSTATE js{};
+            if (Input::NumJoysticks() > 0) Input::GetJoystickState(0, &js);
+            Log("auto: touch %s %llu at %.0f,%.0f; pad 0 buttons %d%d, start %d, stick %d,%d; touch pad %s",
+                s.action.c_str(), (unsigned long long)id, x, y, js.rgbButtons[0] ? 1 : 0,
+                js.rgbButtons[1] ? 1 : 0, js.rgbButtons[6] ? 1 : 0, js.lX, js.lY,
+                TouchControls::DebugState().c_str());
         } else if (s.action == "shot") {
             GetDevice().SaveScreenshot(s.arg.c_str());
             Log("auto: screenshot %s", s.arg.c_str());
@@ -1081,9 +1161,39 @@ int CD3DApplication::Run() {
         bool gotEvent = m_bActive ? SDL_PollEvent(&e) : SDL_WaitEventTimeout(&e, 100);
         while (gotEvent) {
             Input::HandleEvent(e);
+            TouchControls::HandleEvent(e, &GetDevice());
             switch (e.type) {
                 case SDL_EVENT_QUIT: quit_ = true; break;
-                case SDL_EVENT_WINDOW_FOCUS_GAINED: Input::SetFocus(true); OnActivateApp(true); break;
+                case SDL_EVENT_WILL_ENTER_BACKGROUND:
+                    Log("App: entering the background");
+                    Input::SetFocus(false);
+                    OnActivateApp(false);
+                    if (!SDL_EnableScreenSaver()) Log("Display: could not enable the screen saver (%s)", SDL_GetError());
+                    m_bActive = false;
+                    if (!GetConfig().Save()) Log("Config: could not save %s", GetConfig().path.c_str());
+                    break;
+                case SDL_EVENT_DID_ENTER_FOREGROUND:
+                    Log("App: back in the foreground");
+                    Input::SetFocus(true);
+                    OnActivateApp(true);
+                    if (!SDL_DisableScreenSaver()) Log("Display: could not disable the screen saver (%s)", SDL_GetError());
+                    SetLastTick((uint64_t)AppTimeMs() * 1000000);  // no catch-up burst
+                    m_bActive = true;
+                    break;
+                case SDL_EVENT_TERMINATING:
+                    Log("App: terminating");
+                    GetConfig().Save();
+                    quit_ = true;
+                    break;
+                case SDL_EVENT_LOW_MEMORY:
+                    Log("App: low memory");
+                    break;
+                case SDL_EVENT_WINDOW_FOCUS_GAINED:
+                    Input::SetFocus(true);
+                    OnActivateApp(true);
+                    if (!m_bActive) SetLastTick((uint64_t)AppTimeMs() * 1000000);
+                    m_bActive = true;
+                    break;
                 case SDL_EVENT_WINDOW_FOCUS_LOST: Input::SetFocus(false); OnActivateApp(false); break;
                 case SDL_EVENT_WINDOW_MINIMIZED: m_bActive = false; break;
                 case SDL_EVENT_WINDOW_RESTORED:
@@ -1103,6 +1213,10 @@ int CD3DApplication::Run() {
                     ResolveDisplay();  // (the numbers may have moved)
                     break;
                 case SDL_EVENT_KEY_DOWN:
+                    if (e.key.scancode == SDL_SCANCODE_AC_BACK) {
+                        if (!e.key.repeat) OnBack();
+                        break;
+                    }
                     if (!e.key.repeat && ((e.key.scancode == SDL_SCANCODE_RETURN && (e.key.mod & SDL_KMOD_ALT)) ||
                                           e.key.scancode == SDL_SCANCODE_F9 || e.key.scancode == SDL_SCANCODE_F11 ||
                                           e.key.scancode == SDL_SCANCODE_F12)) {
@@ -1121,8 +1235,12 @@ int CD3DApplication::Run() {
                     }
                     if (e.key.scancode == SDL_SCANCODE_F12) {
                         char name[1024];
-                        const char* base = SDL_GetBasePath();
-                        snprintf(name, sizeof name, "%smagebros_%u.bmp", base ? base : "", (unsigned)AppTimeMs());
+                        std::string shotDir = AppPaths::DataRoot();
+                        if (shotDir.empty()) {
+                            const char* base = SDL_GetBasePath();
+                            shotDir = base ? base : "";
+                        }
+                        snprintf(name, sizeof name, "%smagebros_%u.bmp", shotDir.c_str(), (unsigned)AppTimeMs());
                         GetDevice().SaveScreenshot(name);
                         Log("Saved screenshot %s", name);
                         break;
@@ -1151,6 +1269,7 @@ int CD3DApplication::Run() {
         DWORD now = AppTimeMs();
         if (windowChangedAt_ && now - windowChangedAt_ >= kWindowSettleMs) SaveWindowState();
         if (!auto_.empty()) HandleAutomation(now);
+        TouchControls::SetMenuOpen(menu_ && menu_->IsOpen());
         if (!m_bActive || !m_bReady) continue;
 
         // frame pacing for the interpolated (decoupled) path; the options menu always redraws (max 60 fps)

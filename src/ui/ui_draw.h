@@ -24,6 +24,9 @@ public:
     float Left() const { return left_; }
     float Right() const { return right_; }
     void Rect(float x0, float y0, float x1, float y1, UIColor c);
+    // Circles, in the same virtual space (the touch controller's stick and buttons).
+    void Disc(float cx, float cy, float radius, UIColor c, int segments = 24);
+    void Ring(float cx, float cy, float outer, float inner, UIColor c, int segments = 24);
     // scale: 1 = 8 px glyphs. Draws a soft drop shadow under the text.
     void Text(float x, float y, const std::string& s, float scale, UIColor c, bool shadow = true);
     float TextWidth(const std::string& s, float scale) const { return (float)s.size() * 8.f * scale; }

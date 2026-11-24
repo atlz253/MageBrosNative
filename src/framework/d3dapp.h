@@ -113,6 +113,9 @@ protected:
     virtual HRESULT FinalCleanup() { return S_OK; }
     // Window-message equivalents for derived classes
     virtual void OnActivateApp(bool active) { (void)active; }
+    // The Android back action: leave the app, or go back one screen.
+    virtual void OnBack();
+    void CloseOptions();
     virtual void OnKeyDown(int dik) { (void)dik; }
     virtual void OnMidiNotifySuccessful() {}
     virtual void OnAutomation(const std::string& action, const std::string& arg) { (void)action; (void)arg; }

@@ -101,6 +101,7 @@ public:
     // just finished is on its way to the screen before the next one is begun)
     void WaitForGpu();
     const FrameLayout& Layout() const { return layout_; }
+    SDL_Window* Window() const { return window_; }
     // For the Statistics Overlay: the graphics card, its maker and the OpenGL version as the
     // driver states them (read at Init), and the antialiasing and texture filtering in effect
     const std::string& GLRenderer() const { return glRenderer_; }

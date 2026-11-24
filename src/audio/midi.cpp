@@ -1,5 +1,6 @@
 #include "midi.h"
 #include "audio.h"
+#include "../core/app_paths.h"
 #include "../core/assets.h"
 #include "../core/log.h"
 #include <SDL3/SDL.h>
@@ -395,6 +396,11 @@ std::vector<SoundFontDir> SoundFontDirs() {
             if (d.dir == dir) return;
         out.push_back({dir, name});
     };
+#if defined(__ANDROID__)
+    // The unpacked bundled bank (and any user .sf2 imported) lives in the app's data root, and
+    // is preferred over the copy inside the APK.
+    add(AppPaths::DataRoot(), "");
+#endif
     add(base, "");
     add(game, game);
 #if defined(__APPLE__)

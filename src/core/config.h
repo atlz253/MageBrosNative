@@ -58,6 +58,7 @@ struct Config {
 
     // input
     int gamepadDeadzone = 25;  // percent
+    int touchControls = 1;     // 0 off, 1 automatic (touch screens), 2 on
     // Remapping: original DirectInput key code -> list of SDL scancode names that trigger it
     std::map<int, std::vector<std::string>> keyBinds;
     std::map<int, std::vector<std::string>> padBinds;  // joystick button index -> gamepad button names

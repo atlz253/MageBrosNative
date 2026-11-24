@@ -6,6 +6,7 @@
 #include "audio/audio.h"
 #include "audio/midi.h"
 #include "audio/music_stream.h"
+#include "core/app_paths.h"
 #include "core/assets.h"
 #include "core/config.h"
 #include "core/game_files.h"
@@ -26,9 +27,11 @@
 #include "game/XLevelView.h"
 #include "gfx/device.h"
 #include "input/input.h"
+#include "input/touch_controls.h"
 #include "ui/ui_draw.h"
 #include "version.h"
 #include <SDL3/SDL.h>
+#include <SDL3/SDL_main.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -323,6 +326,17 @@ protected:
         else active ? Midi::Resume() : Midi::Pause();
     }
 
+    // Android's back action: close the options menu, open it from a level, or leave the game.
+    void OnBack() override {
+        if (OptionsOpen()) {
+            CloseOptions();
+        } else if (app_.InGame()) {
+            OpenOptions();
+        } else {
+            RequestQuit();
+        }
+    }
+
     // ---- the options menu's hooks (native additions)
     // the title menu's own sounds: 0xec moving, 0xed choosing
     void PlayUISound(UISound s) override { app_.Sounds().PlayMono(s == UISound::Move ? 0xec : 0xed, 1.0f); }
@@ -505,14 +519,25 @@ int main(int argc, char** argv) {
     std::string dataPath = basePath;
 #if defined(__APPLE__)
     if (std::string user = Saves::UserFolder(); !user.empty()) dataPath = user;
+#elif defined(__ANDROID__)
+    // The APK is read-only: the ini, log, screenshots, game files and saves live in the app's
+    // per-user folder.
+    dataPath = AppPaths::DataRoot();
+    if (dataPath.empty()) dataPath = basePath;
 #endif
     LogInit((dataPath + "magebros_native.log").c_str());
+    Log("Data folder: %s", dataPath.c_str());
+    AppPaths::UnpackBundledBank();
     SetFatalHook(ShowFatal);
     Log("Mage Bros. Native %s", MBN_VERSION_STRING);
     Config& cfg = GetConfig();
     if (!cfg.Load(dataPath + "magebros_native.ini")) {
         cfg.path = dataPath + "magebros_native.ini";
         cfg.firstRun = true;  // the window is then sized to the monitor (CD3DApplication::Create)
+#if defined(__ANDROID__)
+        cfg.aspect = AspectMode::Widescreen;  // a phone is much wider than 4:3
+        cfg.hudLayout = 1;                    // and the HUD belongs at its edges
+#endif
         cfg.Save();
     } else if (cfg.version < Config::kCurrentVersion || cfg.gameVersion != MBN_VERSION_STRING) {
         // rewrite older files with the current comments, keeping their values, and files from
@@ -520,8 +545,13 @@ int main(int argc, char** argv) {
         cfg.Save();
     }
     std::string gamePath = cfg.gamePath;
+#if defined(__ANDROID__)
+    cfg.fullscreen = FullscreenMode::Borderless;  // the only display mode the platform has
+    if (gamePath.empty()) gamePath = AppPaths::GameFolder();
+#endif
     bool allowUnverified = false, twoPlayer = false, ending = false;
     bool benchmark = false;
+    bool touch = false;
     double benchmarkSeconds = 30.0;
     std::string benchmarkReport;
     for (size_t i = 0; i < args.size(); i++) {
@@ -553,6 +583,7 @@ int main(int argc, char** argv) {
         }
         else if (args[i] == "--windowed") cfg.fullscreen = FullscreenMode::Windowed;
         else if (args[i] == "--fullscreen") cfg.fullscreen = FullscreenMode::Borderless;
+        else if (args[i] == "--touch") touch = true;  // test hook: the touch overlay on desktop
         else if (args[i] == "--size" && i + 2 < args.size()) {
             cfg.windowWidth = atoi(args[++i].c_str());
             cfg.windowHeight = atoi(args[++i].c_str());
@@ -560,8 +591,20 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (touch) SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");  // headless test runs
+#if defined(__ANDROID__)
+    // The game is landscape-only. SDL otherwise derives the orientation from the window size and
+    // would ask for portrait when the saved window was created that way.
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+#endif
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD))
         FatalError("Mage Bros. Native", "SDL initialisation failed: %s", SDL_GetError());
+    bool touchDevice = TouchControls::HasTouchScreen();
+    bool touchEnabled = touch || cfg.touchControls == 2 || (cfg.touchControls == 1 && touchDevice);
+    if (touch) Log("Touch controls: enabled by --touch");
+    TouchControls::Init(touchEnabled);  // before Input::Init, so the virtual pad is pad 0
+    if (!SDL_DisableScreenSaver()) Log("Display: could not disable the screen saver (%s)", SDL_GetError());
+    else Log("Display: screen saver disabled");
     Saves::Init();  // the save folder (the ini's save_path, or the per-user one)
     std::string err;
     if (!Assets::Init(gamePath, allowUnverified, &err)) FatalError("Mage Bros. Native", "%s", err.c_str());
@@ -578,6 +621,8 @@ int main(int argc, char** argv) {
     Log("Audio: master %d%%, sfx %d%%, music %d%% (music: %s)", cfg.masterVolume, cfg.sfxVolume,
         cfg.musicVolume, Midi::BackendName());
     Input::Init();
+    if (TouchControls::Active()) Log("Touch controls: virtual pad is pad 0 (%d pad%s open)", Input::NumJoysticks(),
+                                     Input::NumJoysticks() == 1 ? "" : "s");
 
     int res = 0;
     {
@@ -598,9 +643,11 @@ int main(int argc, char** argv) {
     }
     Log("Shutdown: application");
     Input::Shutdown();
+    TouchControls::Shutdown();
     MusicStream::Shutdown();
     Midi::Shutdown();
     Audio::Shutdown();
+    SDL_EnableScreenSaver();
     Log("Shutdown: SDL");
     SDL_Quit();
     Log("Shutdown: done");

@@ -40,3 +40,36 @@ jobs:
 
       - name: Build, test and package in the Debian 13 container
         run: tools/linux/build.sh
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install the pinned SDK, NDK and CMake
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platforms;android-36" "build-tools;36.1.0" \
+                     "ndk;28.2.13676358" "cmake;3.31.6" "platform-tools"
+
+      - name: Build the debug APK
+        working-directory: android
+        run: ./gradlew :app:assembleDebug --console=plain
+
+      - name: Check the APK's contents
+        run: sh android/check-apk.sh android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Check 16 KB page alignment
+        run: '"$ANDROID_HOME/build-tools/36.1.0/zipalign" -c -P 16 -v 4 android/app/build/outputs/apk/debug/app-debug.apk'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MageBrosNative-android-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk

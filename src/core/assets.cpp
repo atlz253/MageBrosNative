@@ -1,4 +1,5 @@
 #include "assets.h"
+#include "known_builds.h"
 #include "mods.h"
 #include "sha256.h"
 #include "log.h"
@@ -17,11 +18,7 @@ PEResources g_res;
 std::string g_gameDir, g_exePath;
 bool g_verified = false;
 
-// Known builds of MageBros.exe (SHA-256).
-struct KnownBuild { const char* sha256; const char* label; };
-const KnownBuild kKnownBuilds[] = {
-    {"ac191080af002b8ad0615e432faa92a2a47ce76a9aaa667bacf628836c098c49", "Mage Bros. 2.0 (2022 rebuild, freeware)"},
-};
+// Known builds of MageBros.exe (SHA-256) are in known_builds.h.
 
 bool FileExists(const std::string& p) {
     SDL_PathInfo info;
@@ -78,11 +75,10 @@ bool Init(const std::string& explicitPath, bool allowUnverified, std::string* er
     }
     std::string hash = Sha256Hex(bytes.data(), bytes.size());
     g_verified = false;
-    for (auto& k : kKnownBuilds)
-        if (hash == k.sha256) {
-            g_verified = true;
-            Log("Found %s at %s", k.label, found.c_str());
-        }
+    if (const KnownBuilds::Build* k = KnownBuilds::Find(hash)) {
+        g_verified = true;
+        Log("Found %s at %s", k->label, found.c_str());
+    }
     if (!g_verified) {
         if (!allowUnverified) {
             if (error)

@@ -251,6 +251,67 @@ release then shows on the **Releases** page with its zip.
   the identical copies in `build\Release` and `build\fix-builds`. Signing the exe (a code-signing
   certificate) would make this rarer; not set up.
 
+## Building the Android APK
+
+The Android project lives in `android/`. It uses the SDK, NDK, CMake and Gradle versions pinned in
+`android/gradle/libs.versions.toml` (SDK 36, NDK 28.2, CMake 3.31.6, AGP 8.13), and SDL3 3.4.18 is
+fetched by `android/fetch-sdl.sh` on the first build.
+
+```sh
+cd android
+./gradlew :app:assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+The game library (`libmain.so`) and SDL3 are inside the APK; no SDL3 is needed on the phone. The
+APK contains no game content: on first start it asks for the player's `MageBros.exe` and music
+folder.
+
+On the phone the game is landscape-only. The system Back action opens the options menu during a
+level, closes it when the menu is open, and leaves the app from the title screen. The music and
+drawing stop in the background and resume where they were, and the screen stays awake while
+playing. Android cannot change monitors, resolutions, refresh rates, display modes or VSync, so
+those rows are absent from Options > Video; the graphics, sound and frame-limit settings remain.
+The on-screen controls are described in the README (Options > Controls > Touch controls).
+
+Release signing, version codes and the 16 KB page-size check are covered under the release steps
+below.
+
+### Signing and releasing the APK
+
+Release signing uses a keystore outside the repository and four environment variables:
+
+```sh
+export MBN_ANDROID_KEYSTORE=/path/outside/the/repo/magebros-release.jks
+export MBN_ANDROID_STORE_PASSWORD=...
+export MBN_ANDROID_KEY_ALIAS=...
+export MBN_ANDROID_KEY_PASSWORD=...
+cd android
+./gradlew :app:assembleRelease
+```
+
+The APK is `android/app/build/outputs/apk/release/app-release.apk`. `versionName` and
+`versionCode` come from the same CMake version line as the desktop packages (`0.4.47` gives
+version code 447). Only `arm64-v8a` is built.
+
+Before publishing, check it:
+
+```sh
+sh android/check-apk.sh android/app/build/outputs/apk/release/app-release.apk
+"$ANDROID_HOME/build-tools/36.1.0/zipalign" -c -P 16 -v 4 android/app/build/outputs/apk/release/app-release.apk
+"$ANDROID_HOME/build-tools/36.1.0/apksigner" verify android/app/build/outputs/apk/release/app-release.apk
+```
+
+`check-apk.sh` fails on any game content and requires the bundled bank and licence texts. The
+linker aligns the native libraries' load segments to 16 KB; `zipalign` checks the archive side.
+The APK starts on a 16 KB-page Android 16 emulator image (`magebros16k`).
+
+The CI workflow (`.github/workflows/ci.yml`) builds and checks the debug APK on every push and
+pull request. The release workflow adds a signed APK to a release only when the repository
+variable `MBN_ANDROID_RELEASE` is `true` and the four signing secrets
+(`MBN_ANDROID_KEYSTORE_BASE64`, `MBN_ANDROID_STORE_PASSWORD`, `MBN_ANDROID_KEY_ALIAS`,
+`MBN_ANDROID_KEY_PASSWORD`) are set; otherwise desktop releases are unchanged.
+
 ## Where the version lives
 
 Line 3 of `CMakeLists.txt`, `project(MageBrosNative VERSION x.y.z LANGUAGES C CXX)`, is the only

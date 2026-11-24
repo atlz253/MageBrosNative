@@ -82,6 +82,24 @@ with `--game "C:\path\to\MageBros.exe"` or set `path` in the settings file. Linu
 unpack the tarball into a writable folder and run `./MageBrosNative`; the steps are under
 [For developers](#for-developers).
 
+### Android
+
+The APK contains none of the game. On first start it explains what is needed and asks for the
+folder that holds your `MageBros.exe` and `Music01.mid` to `Music06.mid`. It copies only those
+files and an optional `.sf2` into the app's own storage; the folder you chose is left untouched.
+The executable is checked against the supported 2.0 build, and an unknown one is refused unless
+you choose to start it anyway.
+
+The game files can be replaced later from **Options > Game files**; the next start uses them.
+They live with the configuration and saves under
+`Android/data/com.magebros.game/files/MageBrosNative/` on the phone's storage.
+
+The game pauses its music and drawing in the background and returns where it was; the screen
+stays awake while you play. The system **Back** action opens the options menu during a level,
+closes it when the menu is open, and leaves the app from the title screen. Android has one screen,
+so **Options > Video** hides the monitor, resolution, refresh rate, display mode and VSync rows;
+the graphics, sound and frame-limit settings remain.
+
 ## Controls
 
 | | Player 1 | Player 2 |
@@ -107,6 +125,15 @@ Options > Controls.
 to warp to the next level. Shots cost magic, which refills over time. Defeated enemies drop coins;
 spend them in the shops (levels 3, 6 and 9 of worlds 1 to 3, and 4-2, 4-5 and 4-8). World 4 opens
 once worlds 1 to 3 are cleared.
+
+**On a touch screen** the game shows a fixed stick at the lower left, Jump and Fire at the lower right and Start at
+the bottom centre, at the very bottom edge. Fire confirms in the menus, Jump cancels, and Start opens and closes the options
+menu. In the options menu the stick steps once per push along one axis and does not auto-repeat;
+diagonal pushes are ignored.
+**Options > Controls > Touch controls** is Off, Automatic or On; Automatic shows them on a
+touch screen. While a physical gamepad is connected the on-screen controls hide and the gamepad
+controls player 1; they return when it is disconnected. On a desktop build, `--touch` shows the
+controls and the mouse acts as one finger (a test harness).
 
 ## Options
 
@@ -238,6 +265,18 @@ it, or to run the tests that need the game, you still need your own `MageBros.ex
   `make_release.bat` (needs Visual Studio 2022 or newer with "Desktop development with C++"); it
   builds, runs the tests and writes the release zip to `build\`. Step by step, including how a
   release is published: [docs/RELEASING.md](docs/RELEASING.md).
+- **Android:** the `android/` Gradle project builds the APK. The SDK, NDK, CMake and Gradle
+  versions are pinned in `android/gradle/libs.versions.toml`; SDL3 is fetched by
+  `android/fetch-sdl.sh` on the first build.
+
+  ```sh
+  cd android
+  ./gradlew :app:assembleDebug
+  adb install -r app/build/outputs/apk/debug/app-debug.apk
+  ```
+
+  On first start the app asks for your `MageBros.exe` and music folder. Release signing, the
+  16 KB page-size check and the CI jobs are described in [docs/RELEASING.md](docs/RELEASING.md).
 - **macOS:** Apple Silicon, macOS 12 or newer, with CMake 3.20+ and the Xcode command line tools
   (`xcode-select --install`). Nothing else: SDL3 is built from the pinned source, so the zip
   needs no Homebrew and no separately installed SDL3.

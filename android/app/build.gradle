@@ -1,0 +1,133 @@
+plugins {
+    alias(libs.plugins.android.application)
+}
+
+// The program version is the single source: it comes from the CMake project version.
+def cmakeFile = file("../../CMakeLists.txt")
+def versionMatcher = cmakeFile.text =~ /project\(MageBrosNative VERSION ([0-9]+\.[0-9]+\.[0-9]+)/
+def appVersion = versionMatcher.find() ? versionMatcher.group(1) : "0.0.0"
+def versionParts = appVersion.tokenize(".").collect { it as int }
+def appVersionCode = versionParts[0] * 10000 + versionParts[1] * 100 + versionParts[2]
+
+android {
+    namespace = "com.magebros.game"
+    compileSdk = libs.versions.compileSdk.get().toInteger()
+    ndkVersion = libs.versions.ndk.get()
+
+    // Release signing comes from outside the repository: a keystore and its passwords in the
+    // environment (CI secrets, or a local shell). Debug builds use the debug key as usual.
+    def releaseKeystore = System.getenv("MBN_ANDROID_KEYSTORE")
+    def releaseStorePassword = System.getenv("MBN_ANDROID_STORE_PASSWORD")
+    def releaseKeyAlias = System.getenv("MBN_ANDROID_KEY_ALIAS")
+    def releaseKeyPassword = System.getenv("MBN_ANDROID_KEY_PASSWORD")
+    if (releaseKeystore && !(releaseStorePassword && releaseKeyAlias && releaseKeyPassword)) {
+        throw new GradleException("MBN_ANDROID_KEYSTORE is set but the store password, key alias or key password is missing")
+    }
+
+    signingConfigs {
+        if (releaseKeystore) {
+            release {
+                storeFile = file(releaseKeystore)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
+    defaultConfig {
+        applicationId = "com.magebros.game"
+        minSdk = libs.versions.minSdk.get().toInteger()
+        targetSdk = libs.versions.targetSdk.get().toInteger()
+        versionCode = appVersionCode
+        versionName = appVersion
+
+        ndk {
+            abiFilters += ["arm64-v8a"]
+        }
+
+        externalNativeBuild {
+            cmake {
+                arguments "-DANDROID_STL=c++_static"
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("../../CMakeLists.txt")
+            version = libs.versions.cmake.get()
+        }
+    }
+
+    sourceSets {
+        main {
+            // SDL3's Java shim is taken from the pinned source tree, next to the native library.
+            java.srcDirs += ["jni/SDL/android-project/app/src/main/java"]
+            // The bundled bank and the licence texts, staged by stageAssets below.
+            assets.srcDirs += [layout.buildDirectory.dir("generated/assets").get().asFile]
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (releaseKeystore) signingConfig = signingConfigs.release
+        }
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    lint {
+        abortOnError = false
+    }
+}
+
+// SDL3 is downloaded once from the pinned version into app/jni/SDL, where both this build and
+// CMake (through MBN_SDL_SOURCE_DIR) use it. The directory is not committed.
+def sdlDir = file("jni/SDL")
+def fetchSdl = tasks.register("fetchSdl", Exec) {
+    workingDir = rootProject.projectDir
+    commandLine "sh", "fetch-sdl.sh"
+    inputs.file(rootProject.file("fetch-sdl.sh"))
+    inputs.file(rootProject.file("gradle/libs.versions.toml"))
+    outputs.dir(sdlDir)
+}
+
+tasks.matching { it.name == "preBuild" || it.name.startsWith("externalNativeBuild") }.configureEach {
+    dependsOn(fetchSdl)
+}
+
+// Assets the APK carries: the bundled General MIDI bank and the licence texts. Game content is
+// never staged here.
+def stageAssets = tasks.register("stageAssets", Sync) {
+    into(layout.buildDirectory.dir("generated/assets"))
+    from("../../third_party/soundfonts") {
+        include "TimGM6mb.sf2"
+    }
+    into("licenses") {
+        from("../../LICENSE")
+        from("../../THIRD_PARTY_NOTICES.md")
+        from("../../third_party/coldet/COPYING") {
+            rename { "coldet-LGPL.txt" }
+        }
+        from("../../third_party/TimGM6mb-LICENSE") {
+            rename { "TimGM6mb-LICENSE.txt" }
+        }
+    }
+}
+
+tasks.matching {
+    it.name == "preBuild" || it.name.startsWith("merge") && it.name.endsWith("Assets")
+}.configureEach {
+    dependsOn(stageAssets)
+}

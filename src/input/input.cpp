@@ -256,6 +256,13 @@ void InjectKey(int dik, bool down) {
 
 int NumJoysticks() { return (int)g_pads.size(); }
 
+int NumPhysicalPads() {
+    int n = 0;
+    for (auto& p : g_pads)
+        if (!SDL_IsJoystickVirtual(p.id)) n++;
+    return n;
+}
+
 bool GetJoystickState(int index, DIJOYSTATE* js) {
     if (index < 0 || index >= (int)g_pads.size()) return false;
     memset(js, 0, sizeof *js);
